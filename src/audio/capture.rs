@@ -22,6 +22,7 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_STREAMFLAGS_LOOPBACK, IAudioCaptureClient,
 };
 
+use super::frames::{frames_to_move, scatter_interleaved, scatter_silence};
 use super::rt::{ActivatedClient, ComApartment, EventHandle, MmcssRegistration, WaitOutcome};
 use super::{CapturePacing, FaultStage, MAX_SINKS, SharedState};
 use crate::devices::{MixFormat, open_device_by_id};
@@ -340,10 +341,9 @@ unsafe fn push_frames(
     silent: bool,
 ) {
     unsafe {
-        let free_samples = producer.slots();
         // Only whole frames are ever pushed, so the ring never desynchronizes
-        // channel order.
-        let writable_frames = (free_samples / channels).min(frames);
+        // channel order. The arithmetic lives in `frames` and is tested there.
+        let writable_frames = frames_to_move(producer.slots(), channels, frames);
 
         if writable_frames < frames {
             sink.overruns.fetch_add(1, Ordering::Relaxed);
@@ -365,25 +365,20 @@ unsafe fn push_frames(
         };
 
         let (first, second) = chunk.as_mut_slices();
-        let src = data.cast::<f32>();
-        let mut offset = 0usize;
-        for slice in [first, second] {
-            if slice.is_empty() {
-                continue;
-            }
-            let dst = slice.as_mut_ptr().cast::<f32>();
-            if silent {
-                // WASAPI says the buffer contents are undefined when SILENT is
-                // set — the caller must substitute silence, not copy.
-                std::ptr::write_bytes(dst, 0, slice.len());
-            } else {
-                std::ptr::copy_nonoverlapping(src.add(offset), dst, slice.len());
-            }
-            offset += slice.len();
+        if silent {
+            // WASAPI says the buffer contents are undefined when SILENT is
+            // set — substitute silence rather than reading `data` at all.
+            scatter_silence(first, second);
+        } else {
+            // SAFETY: WASAPI guarantees `data` covers the packet it reported,
+            // and `write_samples` never exceeds that packet.
+            let src = std::slice::from_raw_parts(data.cast::<f32>(), write_samples);
+            let copied = scatter_interleaved(first, second, src);
+            debug_assert_eq!(copied, write_samples);
         }
-        debug_assert_eq!(offset, write_samples);
 
-        // SAFETY: every slot handed out above was written exactly once.
+        // SAFETY: both scatter functions initialise every slot they are given,
+        // including any the source did not cover.
         chunk.commit_all();
 
         sink.frames_pushed

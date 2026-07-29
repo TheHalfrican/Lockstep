@@ -551,3 +551,155 @@ fn yes_no(value: bool) -> &'static str {
         "NOT registered"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::{EndpointState, ExtensibleFormat};
+    use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM;
+    use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+
+    fn format(sample_rate: u32, channels: u16, float: bool) -> MixFormat {
+        MixFormat {
+            format_tag: 0xFFFE,
+            channels,
+            sample_rate,
+            avg_bytes_per_sec: sample_rate * u32::from(channels) * 4,
+            block_align: channels * 4,
+            bits_per_sample: 32,
+            cb_size: 22,
+            extensible: Some(ExtensibleFormat {
+                valid_bits_per_sample: 32,
+                channel_mask: 0x3,
+                sub_format: if float {
+                    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+                } else {
+                    KSDATAFORMAT_SUBTYPE_PCM
+                },
+            }),
+        }
+    }
+
+    fn device(index: usize, state: EndpointState, mix_format: Option<MixFormat>) -> DeviceInfo {
+        DeviceInfo {
+            index,
+            id: Some(format!("{{0.0.0.00000000}}.{{device-{index}}}")),
+            friendly_name: Some(format!("Device {index}")),
+            state,
+            mix_format,
+            is_default_console: false,
+            is_default_multimedia: false,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_an_active_float_endpoint() {
+        let d = device(1, EndpointState::Active, Some(format(48_000, 2, true)));
+        let accepted = validate(&d, "sink").expect("an active f32 endpoint is usable");
+        assert_eq!(accepted.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn validate_rejects_every_inactive_state() {
+        for state in [
+            EndpointState::Disabled,
+            EndpointState::NotPresent,
+            EndpointState::Unplugged,
+            EndpointState::Unknown(0x40),
+        ] {
+            let d = device(3, state, Some(format(48_000, 2, true)));
+            let error = validate(&d, "sink").expect_err("inactive endpoints are refused");
+            let message = format!("{error}");
+            assert!(message.contains(state.as_word()), "{message}");
+            assert!(message.contains("not Active"), "{message}");
+            // The message has to identify which device, not just complain.
+            assert!(message.contains("Device 3"), "{message}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_non_float_mix_format() {
+        let d = device(2, EndpointState::Active, Some(format(48_000, 2, false)));
+        let error = validate(&d, "source").expect_err("integer PCM is not handled yet");
+        let message = format!("{error}");
+        assert!(message.contains("non-f32"), "{message}");
+        assert!(message.contains("Device 2"), "{message}");
+    }
+
+    #[test]
+    fn validate_rejects_an_endpoint_with_no_mix_format() {
+        let d = device(4, EndpointState::Active, None);
+        let error = validate(&d, "sink").expect_err("no format means unusable");
+        assert!(format!("{error}").contains("no mix format"));
+    }
+
+    #[test]
+    fn matching_formats_are_accepted() {
+        let source = device(0, EndpointState::Active, None);
+        let sink = device(1, EndpointState::Active, None);
+        let f = format(48_000, 2, true);
+        assert!(require_matching_formats(&source, f, &sink, f).is_ok());
+    }
+
+    #[test]
+    fn a_sample_rate_mismatch_names_both_formats() {
+        let source = device(0, EndpointState::Active, None);
+        let sink = device(1, EndpointState::Active, None);
+        let error = require_matching_formats(
+            &source,
+            format(48_000, 2, true),
+            &sink,
+            format(44_100, 2, true),
+        )
+        .expect_err("rates differ");
+
+        let message = format!("{error}");
+        assert!(message.contains("48000 Hz"), "{message}");
+        assert!(message.contains("44100 Hz"), "{message}");
+        assert!(message.contains("Device 0"), "{message}");
+        assert!(message.contains("Device 1"), "{message}");
+    }
+
+    #[test]
+    fn a_channel_count_mismatch_names_both_formats() {
+        let source = device(0, EndpointState::Active, None);
+        let sink = device(1, EndpointState::Active, None);
+        let error = require_matching_formats(
+            &source,
+            format(48_000, 2, true),
+            &sink,
+            format(48_000, 6, true),
+        )
+        .expect_err("channel counts differ");
+
+        let message = format!("{error}");
+        assert!(message.contains("2 ch"), "{message}");
+        assert!(message.contains("6 ch"), "{message}");
+    }
+
+    #[test]
+    fn duration_formatting_switches_units_sensibly() {
+        assert_eq!(format_duration(45.0), "45 s");
+        assert_eq!(format_duration(89.0), "89 s");
+        assert_eq!(format_duration(600.0), "10.0 min");
+        assert_eq!(format_duration(12_240.0), "3.4 h");
+    }
+
+    #[test]
+    fn labels_longer_than_the_column_are_ellipsised() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exactlyten", 10), "exactlyten");
+        // Nine characters kept, then the ellipsis, for ten columns total.
+        assert_eq!(truncate("elevenchars", 10), "elevencha…");
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // Friendly names can contain non-ASCII; slicing by byte would panic.
+        let name = "Écouteurs — Salon";
+        let cut = truncate(name, 8);
+        assert_eq!(cut.chars().count(), 8);
+        assert!(cut.ends_with('…'));
+    }
+}

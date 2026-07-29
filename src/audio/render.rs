@@ -17,6 +17,7 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, IAudioRenderClient,
 };
 
+use super::frames::{frames_to_move, gather_interleaved, pad_with_silence, whole_frames};
 use super::rt::{ActivatedClient, ComApartment, EventHandle, MmcssRegistration, WaitOutcome};
 use super::{FaultStage, SharedState, SinkState};
 use crate::devices::{MixFormat, open_device_by_id};
@@ -278,42 +279,34 @@ unsafe fn write_period(
         if dst.is_null() {
             return Err(());
         }
-        let dst = dst.cast::<f32>();
 
         let wanted_frames = frames as usize;
+        // SAFETY: WASAPI guarantees the returned buffer holds exactly the
+        // frames we asked for, in the mix format's channel count.
+        let dst = std::slice::from_raw_parts_mut(dst.cast::<f32>(), wanted_frames * channels);
+
         // Whole frames only, so channel order can never slip.
-        let ready_frames = (consumer.slots() / channels).min(wanted_frames);
+        let ready_frames = frames_to_move(consumer.slots(), channels, wanted_frames);
         let mut written_samples = 0usize;
 
         if ready_frames > 0
             && let Ok(chunk) = consumer.read_chunk(ready_frames * channels)
         {
             let (first, second) = chunk.as_slices();
-            for slice in [first, second] {
-                if slice.is_empty() {
-                    continue;
-                }
-                std::ptr::copy_nonoverlapping(
-                    slice.as_ptr(),
-                    dst.add(written_samples),
-                    slice.len(),
-                );
-                written_samples += slice.len();
-            }
+            written_samples = gather_interleaved(dst, first, second);
             chunk.commit_all();
             sink.frames_popped
                 .fetch_add(ready_frames as u64, Ordering::Relaxed);
         }
 
-        let written_frames = written_samples / channels;
+        let written_frames = whole_frames(written_samples, channels);
         if written_frames < wanted_frames {
-            let short = wanted_frames - written_frames;
             sink.underruns.fetch_add(1, Ordering::Relaxed);
             sink.underrun_frames
-                .fetch_add(short as u64, Ordering::Relaxed);
+                .fetch_add((wanted_frames - written_frames) as u64, Ordering::Relaxed);
             // The endpoint buffer is always filled completely: handing WASAPI a
             // partially written block is what produces an audible click.
-            std::ptr::write_bytes(dst.add(written_samples), 0, short * channels);
+            pad_with_silence(dst, written_samples);
         }
 
         if let Err(err) = render_client.ReleaseBuffer(frames, 0) {
@@ -354,7 +347,10 @@ unsafe fn write_silence(
             return Err(());
         }
 
-        std::ptr::write_bytes(dst.cast::<f32>(), 0, frames as usize * channels);
+        // SAFETY: as in `write_period` — the buffer holds exactly the frames
+        // requested, in the mix format's channel count.
+        let dst = std::slice::from_raw_parts_mut(dst.cast::<f32>(), frames as usize * channels);
+        pad_with_silence(dst, 0);
 
         if let Err(err) = render_client.ReleaseBuffer(frames, 0) {
             sink.fault.record(FaultStage::ReleaseBuffer, err.code());

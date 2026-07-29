@@ -3,6 +3,7 @@
 
 pub mod capture;
 pub mod drift;
+pub mod frames;
 pub mod passthrough;
 pub mod render;
 pub mod rt;
@@ -294,8 +295,15 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    /// `sink_count` is clamped to [`MAX_SINKS`] rather than asserted.
+    ///
+    /// Callers are expected to reject an over-large request earlier and with a
+    /// better message — both the CLI parser and `passthrough::run` do — so this
+    /// is the last line of defence, not the primary check. It used to also
+    /// carry a `debug_assert!`, which made the clamp impossible to test: the
+    /// assert fired first in every test build. A defensive path that cannot be
+    /// exercised is not a defensive path.
     pub fn new(sink_count: usize, ring_frames: u64) -> Self {
-        debug_assert!(sink_count <= MAX_SINKS);
         SharedState {
             stop: AtomicBool::new(false),
             frames_captured: AtomicU64::new(0),
@@ -338,5 +346,180 @@ impl SharedState {
 
     pub fn pacing(&self) -> CapturePacing {
         CapturePacing::from_code(self.pacing.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::HRESULT;
+
+    const E_FAIL: HRESULT = HRESULT(0x8000_4005_u32 as i32);
+    const AUDCLNT_E_DEVICE_INVALIDATED: HRESULT = HRESULT(0x8889_0004_u32 as i32);
+
+    #[test]
+    fn empty_fault_slot_reads_as_nothing() {
+        let slot = FaultSlot::default();
+        assert!(slot.take().is_none());
+        assert!(slot.describe("capture thread").is_none());
+    }
+
+    #[test]
+    fn first_fault_wins() {
+        let slot = FaultSlot::default();
+        slot.record(FaultStage::Initialize, E_FAIL);
+        // Later failures are usually consequences of the first; the original is
+        // the one worth reporting.
+        slot.record(FaultStage::Stop, AUDCLNT_E_DEVICE_INVALIDATED);
+
+        let (stage, code) = slot.take().expect("a fault was recorded");
+        assert_eq!(stage, FaultStage::Initialize);
+        assert_eq!(code, E_FAIL);
+    }
+
+    #[test]
+    fn recording_a_none_stage_leaves_the_slot_empty() {
+        // FaultStage::None is the sentinel for "no fault", so writing it must
+        // not make the slot look occupied.
+        let slot = FaultSlot::default();
+        slot.record(FaultStage::None, E_FAIL);
+        assert!(slot.take().is_none());
+    }
+
+    #[test]
+    fn fault_description_names_the_thread_and_the_call() {
+        let slot = FaultSlot::default();
+        slot.record(FaultStage::GetService, E_FAIL);
+
+        let message = slot
+            .describe("render thread for sink 1")
+            .expect("described");
+        assert!(message.contains("render thread for sink 1"), "{message}");
+        assert!(message.contains("IAudioClient::GetService"), "{message}");
+        assert!(message.contains("0x80004005"), "{message}");
+    }
+
+    #[test]
+    fn every_fault_stage_round_trips_through_its_code() {
+        let stages = [
+            FaultStage::None,
+            FaultStage::ComInit,
+            FaultStage::OpenDevice,
+            FaultStage::Activate,
+            FaultStage::FormatMismatch,
+            FaultStage::CreateEvent,
+            FaultStage::Initialize,
+            FaultStage::SetEventHandle,
+            FaultStage::GetService,
+            FaultStage::GetBufferSize,
+            FaultStage::Start,
+            FaultStage::Wait,
+            FaultStage::GetBuffer,
+            FaultStage::ReleaseBuffer,
+            FaultStage::GetPadding,
+            FaultStage::GetDevicePeriod,
+            FaultStage::Stop,
+        ];
+        for stage in stages {
+            assert_eq!(FaultStage::from_code(stage as u32), stage);
+            assert!(!stage.as_str().is_empty());
+        }
+        // An integer no stage maps to degrades to "no fault", never a panic.
+        assert_eq!(FaultStage::from_code(9_999), FaultStage::None);
+    }
+
+    #[test]
+    fn every_pacing_mode_round_trips_through_its_code() {
+        let modes = [
+            CapturePacing::Undetermined,
+            CapturePacing::Event,
+            CapturePacing::Poll,
+            CapturePacing::PollNoEventSupport,
+        ];
+        for mode in modes {
+            assert_eq!(CapturePacing::from_code(mode.code()), mode);
+            assert!(!mode.as_str().is_empty());
+        }
+        assert_eq!(CapturePacing::from_code(42), CapturePacing::Undetermined);
+    }
+
+    #[test]
+    fn pacing_survives_a_round_trip_through_shared_state() {
+        let shared = SharedState::new(1, 24_000);
+        assert_eq!(shared.pacing(), CapturePacing::Undetermined);
+        shared.set_pacing(CapturePacing::Poll);
+        assert_eq!(shared.pacing(), CapturePacing::Poll);
+    }
+
+    #[test]
+    fn occupancy_is_pushed_minus_popped() {
+        let sink = SinkState::new(24_000);
+        assert_eq!(sink.ring_occupancy_frames(), 0);
+
+        sink.frames_pushed.store(12_000, Ordering::Relaxed);
+        assert_eq!(sink.ring_occupancy_frames(), 12_000);
+
+        sink.frames_popped.store(4_800, Ordering::Relaxed);
+        assert_eq!(sink.ring_occupancy_frames(), 7_200);
+    }
+
+    #[test]
+    fn occupancy_saturates_instead_of_wrapping() {
+        // The reporting thread reads two counters that other threads are
+        // advancing. `popped` is read first so it can never be newer than
+        // `pushed`, but the saturating subtraction is the belt to that braces:
+        // a torn read must report an empty ring, never u64::MAX.
+        let sink = SinkState::new(24_000);
+        sink.frames_pushed.store(1_000, Ordering::Relaxed);
+        sink.frames_popped.store(5_000, Ordering::Relaxed);
+
+        assert_eq!(sink.ring_occupancy_frames(), 0);
+        assert_eq!(sink.ring_occupancy_percent(), 0.0);
+    }
+
+    #[test]
+    fn occupancy_percent_tracks_the_setpoint() {
+        let sink = SinkState::new(24_000);
+        sink.frames_pushed.store(12_000, Ordering::Relaxed);
+        // The 50% setpoint milestone 4's controller will regulate to.
+        assert!((sink.ring_occupancy_percent() - 50.0).abs() < 1e-9);
+
+        sink.frames_pushed.store(24_000, Ordering::Relaxed);
+        assert!((sink.ring_occupancy_percent() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn occupancy_percent_survives_a_zero_length_ring() {
+        let sink = SinkState::new(0);
+        assert_eq!(sink.ring_occupancy_percent(), 0.0);
+    }
+
+    #[test]
+    fn sink_count_is_clamped_to_the_hard_ceiling() {
+        // More than two outputs is an explicit non-goal, so an over-large
+        // request is clamped rather than silently indexing out of bounds.
+        let shared = SharedState::new(MAX_SINKS + 5, 24_000);
+        assert_eq!(shared.sink_count(), MAX_SINKS);
+    }
+
+    #[test]
+    fn sinks_have_independent_counters() {
+        // One sink overrunning must not touch the other's accounting.
+        let shared = SharedState::new(2, 24_000);
+        shared.sink(0).overruns.store(7, Ordering::Relaxed);
+        shared.sink(1).frames_pushed.store(480, Ordering::Relaxed);
+
+        assert_eq!(shared.sink(0).overruns.load(Ordering::Relaxed), 7);
+        assert_eq!(shared.sink(1).overruns.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.sink(0).ring_occupancy_frames(), 0);
+        assert_eq!(shared.sink(1).ring_occupancy_frames(), 480);
+    }
+
+    #[test]
+    fn stop_flag_starts_clear_and_latches() {
+        let shared = SharedState::new(1, 24_000);
+        assert!(!shared.should_stop());
+        shared.request_stop();
+        assert!(shared.should_stop());
     }
 }

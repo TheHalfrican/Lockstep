@@ -181,6 +181,15 @@ Write commit messages in imperative mood, subject line under 72 characters, body
 
 **Error handling.** `anyhow` at application boundaries, concrete error types within audio modules. HRESULT failures should carry enough context to identify which device and which call failed.
 
+**Testing.** Target roughly 1:1 test-to-functional code on the pure core, and spend zero effort where tests would be theater. Per layer:
+
+- *DSP and logic* (PI controller, delay line, downmix, drift estimation, presets, CLI, state transitions) — at or above 1:1. This code is pure computation and must be written that way: audio-thread logic lives in pure functions over slices, WASAPI only at the edges, so everything difficult is testable without hardware. A click is a number, not a vibe — assert sample-to-sample discontinuity bounds on the crossfade; simulate a ring with a synthetic clock offset and assert the PI controller's settling time and clamps.
+- *COM/WASAPI seam* — no mocks. The real bugs there (idle endpoints produce no loopback data, intermittent event handles) are things no mock would have contained. This layer is verified by milestone runs and the hardware checks in TARGETSYSTEMQUEUE.md.
+- *GUI* — keep a plain state struct with all transitions as ordinary testable methods; the egui layer is a thin render pass over it. `egui_kittest` (AccessKit queries, simulated input, wgpu snapshots) for widget-level coverage where it earns its keep. Painter-drawn meters get eyeballs, not tests.
+- *Real-time behavior* — deadline misses and pitch wobble only exist on a running system. Long counted soak runs are the test suite for this layer; that is what milestone 4's "runs clean for an hour" means.
+
+CI runs on GitHub Actions (`windows-latest`): `cargo fmt --check`, `clippy -D warnings`, build, and the full unit test suite on every push and PR. Hardware-dependent tests are explicitly out of CI scope — CI proves the pure core, the target machine proves the seam.
+
 **Ask before assuming.** The hardware behavior questions in this document have real answers the user can obtain in seconds by checking Windows Sound settings or the receiver's front panel. Ask rather than implementing both branches speculatively.
 
 ---

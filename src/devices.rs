@@ -550,3 +550,340 @@ pub unsafe fn decode_wave_format(ptr: *const WAVEFORMATEX) -> MixFormat {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Media::KernelStreaming::{
+        SPEAKER_BACK_CENTER, SPEAKER_TOP_FRONT_CENTER, SPEAKER_TOP_FRONT_LEFT,
+    };
+
+    // Channel masks the project actually cares about. The 5.1 and 7.1 values
+    // are the answer to CLAUDE.md's open question about the HDMI endpoint.
+    const MASK_STEREO: u32 = 0x3;
+    const MASK_5_1: u32 = 0x3F;
+    const MASK_7_1: u32 = 0x63F;
+
+    fn extensible(mask: u32, sub_format: GUID) -> ExtensibleFormat {
+        ExtensibleFormat {
+            valid_bits_per_sample: 32,
+            channel_mask: mask,
+            sub_format,
+        }
+    }
+
+    fn mix_format(
+        sample_rate: u32,
+        channels: u16,
+        bits: u16,
+        format_tag: u16,
+        extensible: Option<ExtensibleFormat>,
+    ) -> MixFormat {
+        MixFormat {
+            format_tag,
+            channels,
+            sample_rate,
+            avg_bytes_per_sec: sample_rate * u32::from(channels) * u32::from(bits / 8),
+            block_align: channels * (bits / 8),
+            bits_per_sample: bits,
+            cb_size: if extensible.is_some() { 22 } else { 0 },
+            extensible,
+        }
+    }
+
+    /// The shape every endpoint on the dev machine actually reports.
+    fn shared_mode_f32(sample_rate: u32, channels: u16, mask: u32) -> MixFormat {
+        mix_format(
+            sample_rate,
+            channels,
+            32,
+            0xFFFE,
+            Some(extensible(mask, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)),
+        )
+    }
+
+    fn device(
+        index: usize,
+        id: &str,
+        name: &str,
+        state: EndpointState,
+        mix_format: Option<MixFormat>,
+    ) -> DeviceInfo {
+        DeviceInfo {
+            index,
+            id: Some(id.to_string()),
+            friendly_name: Some(name.to_string()),
+            state,
+            mix_format,
+            is_default_console: false,
+            is_default_multimedia: false,
+            errors: Vec::new(),
+        }
+    }
+
+    /// Stands in for the dev machine: a stale absent entry sharing a friendly
+    /// name with a live one, which is exactly why presets key on IDs.
+    fn fixture() -> Vec<DeviceInfo> {
+        vec![
+            device(
+                0,
+                "{0.0.0.00000000}.{stale-tozo}",
+                "Headphones (TOZO NC9)",
+                EndpointState::NotPresent,
+                None,
+            ),
+            device(
+                1,
+                "{0.0.0.00000000}.{monitor}",
+                "H27T13 (Intel(R) Display Audio)",
+                EndpointState::Active,
+                Some(shared_mode_f32(48_000, 2, MASK_STEREO)),
+            ),
+            device(
+                2,
+                "{0.0.0.00000000}.{live-tozo}",
+                "Headphones (TOZO NC9)",
+                EndpointState::Active,
+                Some(shared_mode_f32(48_000, 2, MASK_STEREO)),
+            ),
+        ]
+    }
+
+    #[test]
+    fn endpoint_states_decode_and_name_themselves() {
+        let cases = [
+            (DEVICE_STATE_ACTIVE, EndpointState::Active, "Active"),
+            (DEVICE_STATE_DISABLED, EndpointState::Disabled, "Disabled"),
+            (
+                DEVICE_STATE_NOTPRESENT,
+                EndpointState::NotPresent,
+                "NotPresent",
+            ),
+            (
+                DEVICE_STATE_UNPLUGGED,
+                EndpointState::Unplugged,
+                "Unplugged",
+            ),
+        ];
+        for (raw, expected, word) in cases {
+            let state = EndpointState::from_raw(raw);
+            assert_eq!(state, expected);
+            assert_eq!(state.as_word(), word);
+        }
+    }
+
+    #[test]
+    fn an_unknown_state_bit_degrades_rather_than_panicking() {
+        let state = EndpointState::from_raw(DEVICE_STATE(0x40));
+        assert_eq!(state, EndpointState::Unknown(0x40));
+        assert_eq!(state.as_word(), "Unknown");
+        assert!(!state.is_active());
+    }
+
+    #[test]
+    fn only_active_counts_as_active() {
+        assert!(EndpointState::Active.is_active());
+        for state in [
+            EndpointState::Disabled,
+            EndpointState::NotPresent,
+            EndpointState::Unplugged,
+            EndpointState::Unknown(0),
+        ] {
+            assert!(!state.is_active(), "{state:?} should not be active");
+        }
+    }
+
+    #[test]
+    fn stereo_channel_mask_decodes() {
+        let ext = extensible(MASK_STEREO, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        assert_eq!(ext.speaker_names(), vec!["FL", "FR"]);
+    }
+
+    #[test]
+    fn five_one_channel_mask_decodes_in_interleave_order() {
+        let ext = extensible(MASK_5_1, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        assert_eq!(
+            ext.speaker_names(),
+            vec!["FL", "FR", "FC", "LFE", "BL", "BR"]
+        );
+    }
+
+    #[test]
+    fn seven_one_channel_mask_decodes_in_interleave_order() {
+        let ext = extensible(MASK_7_1, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        assert_eq!(
+            ext.speaker_names(),
+            vec!["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"]
+        );
+    }
+
+    #[test]
+    fn an_empty_channel_mask_names_no_speakers() {
+        let ext = extensible(0, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        assert!(ext.speaker_names().is_empty());
+    }
+
+    #[test]
+    fn high_top_speaker_bits_decode() {
+        let mask = SPEAKER_TOP_FRONT_LEFT | SPEAKER_TOP_FRONT_CENTER | SPEAKER_BACK_CENTER;
+        let ext = extensible(mask, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        assert_eq!(ext.speaker_names(), vec!["BC", "TFL", "TFC"]);
+    }
+
+    #[test]
+    fn undefined_mask_bits_are_ignored() {
+        // Bit 31 is not a defined speaker position; it must not appear or panic.
+        let ext = extensible(MASK_STEREO | 0x8000_0000, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        assert_eq!(ext.speaker_names(), vec!["FL", "FR"]);
+    }
+
+    #[test]
+    fn sub_format_guids_are_identified() {
+        assert_eq!(
+            extensible(MASK_STEREO, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT).sub_format_name(),
+            "KSDATAFORMAT_SUBTYPE_IEEE_FLOAT"
+        );
+        assert_eq!(
+            extensible(MASK_STEREO, KSDATAFORMAT_SUBTYPE_PCM).sub_format_name(),
+            "KSDATAFORMAT_SUBTYPE_PCM"
+        );
+        assert_eq!(
+            extensible(MASK_STEREO, GUID::from_u128(0xdead_beef)).sub_format_name(),
+            "unrecognized SubFormat GUID"
+        );
+    }
+
+    #[test]
+    fn container_names_cover_the_tags_we_expect() {
+        assert_eq!(
+            shared_mode_f32(48_000, 2, MASK_STEREO).container_name(),
+            "WAVE_FORMAT_EXTENSIBLE"
+        );
+        assert_eq!(
+            mix_format(48_000, 2, 16, 1, None).container_name(),
+            "WAVE_FORMAT_PCM"
+        );
+        assert_eq!(
+            mix_format(48_000, 2, 32, 3, None).container_name(),
+            "WAVE_FORMAT_IEEE_FLOAT"
+        );
+        assert_eq!(
+            mix_format(48_000, 2, 32, 0x1234, None).container_name(),
+            "unrecognized wFormatTag"
+        );
+    }
+
+    #[test]
+    fn extensible_float_is_f32() {
+        assert!(shared_mode_f32(48_000, 2, MASK_STEREO).is_f32());
+    }
+
+    #[test]
+    fn plain_ieee_float_without_a_tail_is_f32() {
+        assert!(mix_format(48_000, 2, 32, 3, None).is_f32());
+    }
+
+    #[test]
+    fn extensible_pcm_is_not_f32() {
+        // 32 bits wide but integer samples — the passthrough path must refuse
+        // this rather than reinterpret the bits as floats.
+        let format = mix_format(
+            48_000,
+            2,
+            32,
+            0xFFFE,
+            Some(extensible(MASK_STEREO, KSDATAFORMAT_SUBTYPE_PCM)),
+        );
+        assert!(!format.is_f32());
+    }
+
+    #[test]
+    fn sixteen_bit_is_not_f32() {
+        assert!(!mix_format(48_000, 2, 16, 1, None).is_f32());
+        // Even when the tag claims float, the width has the final say.
+        assert!(!mix_format(48_000, 2, 16, 3, None).is_f32());
+    }
+
+    #[test]
+    fn summary_reports_the_facts_an_error_message_needs() {
+        let summary = shared_mode_f32(48_000, 2, MASK_STEREO).summary();
+        assert!(summary.contains("48000 Hz"), "{summary}");
+        assert!(summary.contains("2 ch"), "{summary}");
+        assert!(summary.contains("32-bit"), "{summary}");
+        assert!(summary.contains("f32"), "{summary}");
+        assert!(summary.contains("WAVE_FORMAT_EXTENSIBLE"), "{summary}");
+
+        let pcm = mix_format(44_100, 6, 16, 1, None).summary();
+        assert!(pcm.contains("44100 Hz"), "{pcm}");
+        assert!(pcm.contains("6 ch"), "{pcm}");
+        assert!(pcm.contains("non-f32"), "{pcm}");
+    }
+
+    #[test]
+    fn resolve_spec_finds_a_device_by_index() {
+        let devices = fixture();
+        let found = resolve_spec(&devices, "1").expect("index 1 resolves");
+        assert_eq!(found.index, 1);
+        assert_eq!(found.id.as_deref(), Some("{0.0.0.00000000}.{monitor}"));
+    }
+
+    #[test]
+    fn resolve_spec_finds_a_device_by_verbatim_id() {
+        let devices = fixture();
+        let found =
+            resolve_spec(&devices, "{0.0.0.00000000}.{live-tozo}").expect("the id resolves");
+        assert_eq!(found.index, 2);
+    }
+
+    #[test]
+    fn an_id_disambiguates_devices_sharing_a_friendly_name() {
+        // Two endpoints called "Headphones (TOZO NC9)"; only the ID separates
+        // them. This is the whole reason presets key on IDs.
+        let devices = fixture();
+        let stale = resolve_spec(&devices, "{0.0.0.00000000}.{stale-tozo}").unwrap();
+        let live = resolve_spec(&devices, "{0.0.0.00000000}.{live-tozo}").unwrap();
+        assert_eq!(stale.friendly_name, live.friendly_name);
+        assert_ne!(stale.index, live.index);
+        assert!(!stale.state.is_active());
+        assert!(live.state.is_active());
+    }
+
+    #[test]
+    fn resolve_spec_rejects_an_index_past_the_end() {
+        let devices = fixture();
+        let error = resolve_spec(&devices, "99").expect_err("99 is out of range");
+        let message = format!("{error}");
+        assert!(message.contains("99"), "{message}");
+        assert!(message.contains('3'), "{message}");
+    }
+
+    #[test]
+    fn a_numeric_spec_never_falls_through_to_id_matching() {
+        // "0" parses as an index, so it resolves positionally even though no
+        // device ID looks like that. Documents the precedence deliberately.
+        let devices = fixture();
+        assert_eq!(resolve_spec(&devices, "0").unwrap().index, 0);
+    }
+
+    #[test]
+    fn resolve_spec_rejects_an_unknown_id() {
+        let devices = fixture();
+        let error = resolve_spec(&devices, "{0.0.0.00000000}.{nope}").expect_err("no such id");
+        assert!(format!("{error}").contains("lockstep list"));
+    }
+
+    #[test]
+    fn resolve_spec_on_an_empty_list_fails_cleanly() {
+        assert!(resolve_spec(&[], "0").is_err());
+        assert!(resolve_spec(&[], "{some-id}").is_err());
+    }
+
+    #[test]
+    fn resolve_spec_skips_devices_with_no_id() {
+        let mut devices = fixture();
+        devices[1].id = None;
+        // Index lookup still works; ID lookup for the missing one cannot match.
+        assert_eq!(resolve_spec(&devices, "1").unwrap().index, 1);
+        assert!(resolve_spec(&devices, "{0.0.0.00000000}.{monitor}").is_err());
+    }
+}

@@ -1,0 +1,46 @@
+name: CI
+
+# The pure core only. Everything that needs a real audio endpoint — loopback
+# capture, render clients, drift observation — is verified on the target
+# machine, not here: a hosted runner has no audio hardware and mocking the
+# WASAPI seam would only test the mock.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately no global `RUSTFLAGS: -D warnings`: RUSTFLAGS applies to
+  # dependencies too, so a warning inside the `windows` crate would fail our
+  # build for no reason. The lint gate is the clippy step below, which only
+  # lints this crate.
+
+jobs:
+  check:
+    # windows-latest is not a preference. The `windows` crate binds Win32
+    # directly and the crate does not build anywhere else.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      # --all-targets so test code is linted to the same standard as the crate.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test

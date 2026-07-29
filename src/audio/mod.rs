@@ -3,6 +3,11 @@
 
 pub mod capture;
 pub mod control;
+// Milestone 5's delay line. Nothing calls it yet: integration into the render
+// path is gated on the milestone 4 drift-correction soak passing, so the audio
+// path stays frozen while it is being certified.
+#[allow(dead_code)]
+pub mod delay;
 pub mod drift;
 pub mod frames;
 pub mod passthrough;

@@ -12,7 +12,7 @@ Lockstep — Windows dual-output audio router
 USAGE:
     lockstep [list]
     lockstep play --sink <index|id> [--sink <index|id>] [--source <index|id>]
-                  [--duration <secs>] [--status-interval <secs>]
+                  [--duration <secs>] [--status-interval <secs>] [--no-correction]
     lockstep help
 
 COMMANDS:
@@ -26,6 +26,9 @@ OPTIONS:
                                default Console render endpoint.
     --duration <secs>          Stop after this long. Without it, runs until Enter.
     --status-interval <secs>   Seconds between status lines. Default 1.
+    --no-correction            Disable drift correction. The ring is left to
+                               fill or drain on its own, as in milestone 3 —
+                               this is how uncorrected drift gets measured.
 
 Indices are the bracketed numbers from `lockstep list`; IDs are the verbatim
 device ID strings from the same report. IDs are stable across reboots and
@@ -47,6 +50,9 @@ pub struct PlayArgs {
     pub duration_secs: Option<f64>,
     /// `None` means the default interval.
     pub status_interval_secs: Option<f64>,
+    /// Set by `--no-correction`. Correction is on by default, so this is the
+    /// opt-*out*; `PlayArgs::default()` therefore means "corrected".
+    pub no_correction: bool,
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
@@ -85,6 +91,9 @@ fn parse_play<I: Iterator<Item = String>>(mut args: I) -> Result<PlayArgs> {
             }
             "--status-interval" => {
                 parsed.status_interval_secs = Some(take_positive(&mut args, "--status-interval")?);
+            }
+            "--no-correction" => {
+                parsed.no_correction = true;
             }
             other => bail!("unknown option `{other}` for `play`\n\n{USAGE}"),
         }
@@ -152,6 +161,7 @@ mod tests {
             sinks: vec!["{0.0.0.00000000}.{abc}".into()],
             duration_secs: Some(5.0),
             status_interval_secs: Some(2.5),
+            no_correction: false,
         });
         let parsed = parse_str(&[
             "play",
@@ -197,6 +207,33 @@ mod tests {
         assert!(parse_str(&["play", "--sink", "4", "--duration", "0"]).is_err());
         assert!(parse_str(&["play", "--sink", "4", "--duration", "-2"]).is_err());
         assert!(parse_str(&["play", "--sink", "4", "--duration", "soon"]).is_err());
+    }
+
+    #[test]
+    fn correction_is_on_unless_opted_out() {
+        let Command::Play(on) = parse_str(&["play", "--sink", "4"]).unwrap() else {
+            panic!("expected a play command");
+        };
+        assert!(!on.no_correction, "correction must default to enabled");
+
+        let Command::Play(off) = parse_str(&["play", "--sink", "4", "--no-correction"]).unwrap()
+        else {
+            panic!("expected a play command");
+        };
+        assert!(off.no_correction);
+    }
+
+    #[test]
+    fn no_correction_takes_no_value() {
+        // It is a bare flag, so the next token must still parse as a flag.
+        let Command::Play(args) =
+            parse_str(&["play", "--no-correction", "--sink", "4", "--duration", "10"]).unwrap()
+        else {
+            panic!("expected a play command");
+        };
+        assert!(args.no_correction);
+        assert_eq!(args.sinks, vec!["4".to_string()]);
+        assert_eq!(args.duration_secs, Some(10.0));
     }
 
     #[test]

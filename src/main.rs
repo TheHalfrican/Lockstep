@@ -105,6 +105,7 @@ fn play(args: PlayArgs) -> Result<()> {
         sinks: &sinks,
         duration: args.duration_secs.map(Duration::from_secs_f64),
         status_interval: args.status_interval_secs.map(Duration::from_secs_f64),
+        correction: !args.no_correction,
     })
 }
 

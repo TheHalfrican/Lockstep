@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 # Lock-free SPSC ring between the capture thread and the render thread.
 rtrb = "0.3.4"
+rubato = "4.0.0"
 
 [dependencies.windows]
 version = "0.62.2"

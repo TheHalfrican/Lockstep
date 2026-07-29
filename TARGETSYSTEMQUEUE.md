@@ -138,6 +138,41 @@ cargo run -- play --source <A50X ID> --sink <A50X ID> --sink <Gen4 ID> --status-
       drift harder, exhaustion inside an hour is *useful data, not a failure* —
       it sizes the problem milestone 4 must solve.)
 
+## 5b. Corrected soak — the real milestone 4 acceptance
+
+Milestone 4 added drift correction (PI controller driving a rubato ASRC).
+The uncorrected runs in §5 use `--no-correction`; everything else runs
+corrected by default. Two notes from the work-machine tuning that matter here:
+
+- **The mean correction figure is now the primary drift measurement.** It
+  integrates over ~100 updates/sec instead of regressing a handful of
+  quantized occupancy samples; its summary line prints the implied clock
+  offset directly. Prefer it over the `drift` estimator line (which stays
+  useful mainly for `--no-correction` runs and as a flatness check).
+- The controller was tuned against Bluetooth pacing jitter, erring heavily
+  toward quiet (settles ~45 s, wobble ±25 ppm on the pathological
+  BT-source-equals-sink case). If the Astro paths are cleaner, the residual
+  wobble should be much smaller. If you see the correction *oscillating*
+  rather than settling, that's a tuning problem on real hardware — report it.
+
+**One hour per preset pair, corrected:**
+
+```powershell
+cargo run -- play --source <A50X ID> --sink <A50X ID> --sink <Gen4 ID> --status-interval 30 --duration 3600
+cargo run -- play --source <A50X ID> --sink <A50X ID> --sink <HDMI ID> --status-interval 30 --duration 3600
+```
+
+Pass criteria, per sink:
+
+- [ ] Zero underruns, zero overruns over the full hour
+- [ ] Ring held at setpoint (occupancy flat, ~50%)
+- [ ] Correction settled and *stable* — a steady mean with small wobble, not
+      oscillation, and the implied clock offset recorded in HARDWARE.md
+- [ ] Never clamped (a controller pinned at ±500 ppm is reporting a hardware
+      fault, not correcting drift — the status line shows it)
+- [ ] At least one soak with music playing throughout, listened to at least
+      intermittently: no audible pitch wobble, clicks, or dropouts
+
 ## 6. Reality checks (data for the reconnection milestone)
 
 Current code does **not** handle device invalidation gracefully yet — these are

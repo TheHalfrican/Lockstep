@@ -50,6 +50,9 @@ pub struct PassthroughConfig<'a> {
     pub sinks: &'a [&'a DeviceInfo],
     pub duration: Option<Duration>,
     pub status_interval: Option<Duration>,
+    /// Whether each render thread runs its ASRC and PI controller. Off leaves
+    /// the ring free-running, which is how uncorrected drift is measured.
+    pub correction: bool,
 }
 
 /// A sink resolved and ready to run.
@@ -136,6 +139,7 @@ pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
 
         let shared = Arc::clone(&shared);
         let device_id = plan.device_id.clone();
+        let correction = config.correction;
         let handle = thread::Builder::new()
             .name(format!("lockstep-render-{index}"))
             .spawn(move || {
@@ -144,6 +148,7 @@ pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
                     source_format,
                     prebuffer_frames,
                     index,
+                    correction,
                     shared,
                     consumer,
                 )
@@ -284,6 +289,14 @@ fn print_header(
         None => println!("run      until Enter is pressed"),
     }
     println!("status   every {:.1} s", status_interval.as_secs_f64());
+    println!(
+        "drift    {}",
+        if config.correction {
+            "correction ON — PI controller trims the resampler ratio to hold the ring at setpoint"
+        } else {
+            "correction OFF — ring free-running, drift is left visible"
+        }
+    );
 
     // A sink that is also the source shares the source's clock. Its occupancy
     // must stay flat, which makes it a useful control against the other sink.
@@ -382,9 +395,23 @@ fn status_loop(
                 estimators[index].observe(elapsed, occupancy);
             }
 
+            // Under correction this should read ~0: a flat ring is the success
+            // signal, and the drift itself has moved into the correction
+            // figure next to it.
+            let drift_label = if primed {
+                estimators[index].short_label()
+            } else {
+                "priming".to_string()
+            };
+            let correction_label = if sink.correction_enabled() {
+                format!("{:+7.1} ppm", sink.correction_ppm())
+            } else {
+                "     off".to_string()
+            };
+
             println!(
                 "    sink {index} {:<26}  out={:>11} (+{:>7})  ring={:5.1}% ({:>6}/{} fr)  \
-                 under={} ({} fr)  over={} ({} fr)  drift≈ {}",
+                 under={} ({} fr)  over={} ({} fr)  drift≈ {}  corr={}",
                 truncate(&plan.label, 26),
                 rendered,
                 rendered.saturating_sub(last_rendered[index]),
@@ -395,11 +422,8 @@ fn status_loop(
                 sink.underrun_frames.load(Ordering::Relaxed),
                 sink.overruns.load(Ordering::Relaxed),
                 sink.overrun_frames.load(Ordering::Relaxed),
-                if primed {
-                    estimators[index].short_label()
-                } else {
-                    "priming".to_string()
-                },
+                drift_label,
+                correction_label,
             );
             last_rendered[index] = rendered;
         }
@@ -474,7 +498,51 @@ fn print_summary(shared: &SharedState, plans: &[SinkPlan], estimators: &[DriftEs
             yes_no(sink.mmcss.load(Ordering::Relaxed))
         );
 
+        print_correction(sink);
         print_drift(&estimators[index], sink);
+    }
+}
+
+/// Report the controller's own account of the clock offset.
+///
+/// Under correction this, not the drift estimator, is where the drift figure
+/// lives: the controller settles at exactly minus the clock offset, so the mean
+/// correction *is* the measurement.
+fn print_correction(sink: &SinkState) {
+    if !sink.correction_enabled() {
+        println!("    correction         disabled (--no-correction)");
+        return;
+    }
+
+    let latency = sink.asrc_latency_frames();
+    if latency > 0 {
+        println!(
+            "    ASRC latency       ≤{latency} frames ({:.1} ms worst case; ~0 in steady state)",
+            latency as f64 / 48.0
+        );
+    }
+
+    match sink.mean_correction_ppm() {
+        None => println!("    correction         enabled, but never ran"),
+        Some(mean) => {
+            println!(
+                "    correction         {:+.2} ppm final, {:+.2} ppm mean over {} updates",
+                sink.correction_ppm(),
+                mean,
+                sink.correction_updates()
+            );
+            let clamped = sink.correction_clamped_updates();
+            if clamped > 0 {
+                println!(
+                    "                       CLAMPED on {clamped} update(s) — at ±500 ppm this \
+                     is a device problem, not drift"
+                );
+            }
+            println!(
+                "                       implied clock offset {:+.2} ppm (correction cancels it)",
+                -mean
+            );
+        }
     }
 }
 

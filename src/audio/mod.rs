@@ -2,13 +2,15 @@
 //! the state shared between those threads and the reporting thread.
 
 pub mod capture;
+pub mod control;
 pub mod drift;
 pub mod frames;
 pub mod passthrough;
 pub mod render;
 pub mod rt;
+pub mod staging;
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// Hard ceiling on simultaneous outputs.
 ///
@@ -89,6 +91,8 @@ pub enum FaultStage {
     GetPadding = 14,
     GetDevicePeriod = 15,
     Stop = 16,
+    ResamplerInit = 17,
+    Resample = 18,
 }
 
 impl FaultStage {
@@ -110,6 +114,8 @@ impl FaultStage {
             14 => FaultStage::GetPadding,
             15 => FaultStage::GetDevicePeriod,
             16 => FaultStage::Stop,
+            17 => FaultStage::ResamplerInit,
+            18 => FaultStage::Resample,
             _ => FaultStage::None,
         }
     }
@@ -133,6 +139,8 @@ impl FaultStage {
             FaultStage::GetPadding => "IAudioClient::GetCurrentPadding",
             FaultStage::GetDevicePeriod => "IAudioClient::GetDevicePeriod",
             FaultStage::Stop => "IAudioClient::Stop",
+            FaultStage::ResamplerInit => "building the resampler",
+            FaultStage::Resample => "Resampler::process_into_buffer",
         }
     }
 }
@@ -219,6 +227,25 @@ pub struct SinkState {
 
     pub fault: FaultSlot,
 
+    /// Live drift correction, in ppm scaled by 1000.
+    ///
+    /// Fixed point rather than a float because there is no `AtomicF64` and
+    /// bit-punning one through an `AtomicU64` reads worse than it's worth for a
+    /// value that only ever gets printed. A milli-ppm resolution is three
+    /// digits finer than anything meaningful here.
+    correction_millippm: AtomicI64,
+    /// Running sum and count, for the mean correction over a session.
+    correction_sum_millippm: AtomicI64,
+    correction_updates: AtomicU64,
+    /// Updates where the controller was pinned at its ±500 ppm limit. A nonzero
+    /// count means a device problem, not drift.
+    correction_clamped: AtomicU64,
+    /// Whether this sink is running the resampler at all.
+    correction_enabled: AtomicBool,
+    /// Frames of latency the ASRC stage adds: resampler group delay plus the
+    /// worst-case staging backlog. Zero when correction is off.
+    asrc_latency_frames: AtomicU64,
+
     ring_frames: u64,
 }
 
@@ -237,8 +264,66 @@ impl SinkState {
             primed: AtomicBool::new(false),
             mmcss: AtomicBool::new(false),
             fault: FaultSlot::default(),
+            correction_millippm: AtomicI64::new(0),
+            correction_sum_millippm: AtomicI64::new(0),
+            correction_updates: AtomicU64::new(0),
+            correction_clamped: AtomicU64::new(0),
+            correction_enabled: AtomicBool::new(false),
+            asrc_latency_frames: AtomicU64::new(0),
             ring_frames,
         }
+    }
+
+    /// Publish one controller update. Called from the render thread, so it must
+    /// stay to plain atomic arithmetic.
+    pub fn record_correction(&self, ppm: f64, clamped: bool) {
+        let scaled = (ppm * 1000.0) as i64;
+        self.correction_millippm.store(scaled, Ordering::Relaxed);
+        self.correction_sum_millippm
+            .fetch_add(scaled, Ordering::Relaxed);
+        self.correction_updates.fetch_add(1, Ordering::Relaxed);
+        if clamped {
+            self.correction_clamped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_correction_enabled(&self, enabled: bool) {
+        self.correction_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn correction_enabled(&self) -> bool {
+        self.correction_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Latest correction in ppm.
+    pub fn correction_ppm(&self) -> f64 {
+        self.correction_millippm.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
+    /// Mean correction across the session, or `None` before the first update.
+    pub fn mean_correction_ppm(&self) -> Option<f64> {
+        let updates = self.correction_updates.load(Ordering::Relaxed);
+        if updates == 0 {
+            return None;
+        }
+        let sum = self.correction_sum_millippm.load(Ordering::Relaxed) as f64;
+        Some(sum / 1000.0 / updates as f64)
+    }
+
+    pub fn correction_clamped_updates(&self) -> u64 {
+        self.correction_clamped.load(Ordering::Relaxed)
+    }
+
+    pub fn correction_updates(&self) -> u64 {
+        self.correction_updates.load(Ordering::Relaxed)
+    }
+
+    pub fn set_asrc_latency_frames(&self, frames: u64) {
+        self.asrc_latency_frames.store(frames, Ordering::Relaxed);
+    }
+
+    pub fn asrc_latency_frames(&self) -> u64 {
+        self.asrc_latency_frames.load(Ordering::Relaxed)
     }
 
     pub fn ring_frames(&self) -> u64 {
@@ -419,6 +504,8 @@ mod tests {
             FaultStage::GetPadding,
             FaultStage::GetDevicePeriod,
             FaultStage::Stop,
+            FaultStage::ResamplerInit,
+            FaultStage::Resample,
         ];
         for stage in stages {
             assert_eq!(FaultStage::from_code(stage as u32), stage);

@@ -1,54 +1,28 @@
-//! Session setup for passthrough: validate, wire one ring per sink, spawn the
-//! capture and render threads, report drift, and shut down cleanly.
+//! The CLI's `play` command: a status loop and a stdin reader wrapped around a
+//! [`Session`].
 //!
-//! Topology, matching the CLAUDE.md architecture diagram minus the processing
-//! stages that do not exist yet:
-//!
-//! ```text
-//! WASAPI loopback capture (source endpoint)
-//!         ├──> rtrb ring ──> render thread A
-//!         └──> rtrb ring ──> render thread B
-//! ```
-//!
-//! The two sinks are fully independent: separate rings, separate render
-//! threads, separate counters, separate fault slots. Nothing synchronises them,
-//! which is the point of this milestone — the drift between their clocks is
-//! what we are here to measure.
+//! Everything that actually moves audio lives in [`super::session`]. This file
+//! is presentation — headers, the per-interval status block, the closing
+//! summary — plus the interactive command driver. The GUI is a sibling of this
+//! module, not a layer above it: both drive the same `Session` and read the
+//! same atomics.
 
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use rtrb::RingBuffer;
+use anyhow::{Result, bail};
 
-use super::command::{Command, StdinAction, pair_delays, parse_line};
+use super::command::{StdinAction, parse_line};
 use super::drift::DriftEstimator;
-use super::render::RenderConfig;
-use super::{MAX_SINKS, SharedState, SinkState, capture, render};
-use crate::devices::{DeviceInfo, MixFormat};
-
-/// Ring depth. 500 ms is far more than passthrough needs, but milestone 4's
-/// drift controller regulates occupancy around the midpoint and needs room to
-/// swing in both directions before anything breaks.
-const RING_DURATION_MS: u64 = 500;
-
-/// Target fill before a render client starts, as a fraction of ring depth.
-/// The same 50% setpoint the PI controller will later regulate to.
-const PREBUFFER_FRACTION: f64 = 0.5;
+use super::session::{PREBUFFER_FRACTION, RING_DURATION_MS, Session, SessionConfig, display_name};
+use super::{SharedState, SinkState};
+use crate::devices::DeviceInfo;
 
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Command queue depth, per sink.
-///
-/// The render thread drains to empty every callback — about 100 times a second
-/// — so this only has to absorb a burst arriving between two drains. A human
-/// typing cannot fill it and a 60 Hz GUI slider would need the audio thread to
-/// stall for most of a second. Sized generously anyway because the memory is
-/// nothing and a dropped parameter change is a confusing bug to chase.
-const COMMAND_QUEUE_DEPTH: usize = 64;
 
 /// Occupancy samples inside this window after the first reading are discarded
 /// from the drift fit: the ring is still settling from prebuffer and the
@@ -61,260 +35,77 @@ pub struct PassthroughConfig<'a> {
     pub sinks: &'a [&'a DeviceInfo],
     pub duration: Option<Duration>,
     pub status_interval: Option<Duration>,
-    /// Whether each render thread runs its ASRC and PI controller. Off leaves
-    /// the ring free-running, which is how uncorrected drift is measured.
     pub correction: bool,
-    /// Startup delays in milliseconds, paired positionally with `sinks`.
-    /// Shorter than `sinks` is fine; the rest default to zero.
     pub delays_ms: &'a [f64],
 }
 
-/// A sink resolved and ready to run.
-struct SinkPlan {
-    label: String,
-    device_id: String,
-    delay_ms: f64,
-}
-
 pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
-    let source_format = validate(config.source, "source")?;
-    let sink_count = config.sinks.len();
+    let mut session = Session::start(SessionConfig {
+        source: config.source,
+        sinks: config.sinks,
+        delays_ms: config.delays_ms,
+        correction: config.correction,
+    })?;
 
-    if sink_count == 0 {
-        bail!("passthrough needs at least one sink");
-    }
-    if sink_count > MAX_SINKS {
-        bail!("at most {MAX_SINKS} sinks are supported, got {sink_count}");
-    }
-
-    let delays = pair_delays(sink_count, config.delays_ms).map_err(anyhow::Error::msg)?;
-
-    let mut plans: Vec<SinkPlan> = Vec::with_capacity(sink_count);
-    for (position, sink) in config.sinks.iter().enumerate() {
-        let sink_format = validate(sink, "sink")?;
-        require_matching_formats(config.source, source_format, sink, sink_format)?;
-
-        let device_id = sink
-            .id
-            .clone()
-            .with_context(|| format!("sink endpoint [{}] has no device id", sink.index))?;
-
-        // Two render clients on one endpoint would teach us nothing about
-        // drift — they share a clock by construction — and the second
-        // Initialize may well fail anyway.
-        if let Some(existing) = plans.iter().find(|p| p.device_id == device_id) {
-            bail!(
-                "the same endpoint was given twice as a sink: {} and [{}] {} both resolve to\n  \
-                 {}\nTwo render streams on one endpoint share a clock, so this measures nothing. \
-                 Pick two different devices.",
-                existing.label,
-                sink.index,
-                display_name(sink),
-                device_id
-            );
-        }
-
-        plans.push(SinkPlan {
-            label: format!("[{}] {}", sink.index, display_name(sink)),
-            device_id,
-            delay_ms: delays[position],
-        });
-    }
-
-    let source_id = config
-        .source
-        .id
-        .clone()
-        .context("source endpoint has no device id")?;
-
-    let channels = source_format.channels as usize;
-    let sample_rate = source_format.sample_rate;
-    let ring_frames = (u64::from(sample_rate) * RING_DURATION_MS / 1000) as usize;
-    let ring_samples = ring_frames * channels;
-    let prebuffer_frames = (ring_frames as f64 * PREBUFFER_FRACTION) as usize;
     let status_interval = config.status_interval.unwrap_or(DEFAULT_STATUS_INTERVAL);
+    print_header(&session, config.source, config.duration, status_interval);
 
-    print_header(
-        &config,
-        &plans,
-        &source_id,
-        source_format,
-        ring_frames,
-        prebuffer_frames,
-        status_interval,
-    );
-
-    let shared = Arc::new(SharedState::new(sink_count, ring_frames as u64));
-
-    // One ring per sink. Producers go to the single capture thread as a fixed
-    // array; each consumer goes to its own render thread.
-    let mut feeds: capture::SinkFeeds = [const { None }; MAX_SINKS];
-    let mut render_threads = Vec::with_capacity(sink_count);
-    // Producer ends of the parameter queues, handed to the control thread.
-    let mut command_senders = Vec::with_capacity(sink_count);
-
-    for (index, plan) in plans.iter().enumerate() {
-        let (producer, consumer) = RingBuffer::<f32>::new(ring_samples);
-        feeds[index] = Some(producer);
-
-        // One command queue per render thread: single producer on the control
-        // side, single consumer on the audio side, which is exactly what rtrb
-        // is for.
-        let (sender, receiver) = RingBuffer::<Command>::new(COMMAND_QUEUE_DEPTH);
-        command_senders.push(sender);
-
-        let shared = Arc::clone(&shared);
-        let render_config = RenderConfig {
-            device_id: plan.device_id.clone(),
-            format: source_format,
-            prebuffer_frames,
-            sink_index: index,
-            correction: config.correction,
-            delay_ms: plan.delay_ms,
-        };
-        let handle = thread::Builder::new()
-            .name(format!("lockstep-render-{index}"))
-            .spawn(move || render::run(render_config, shared, consumer, receiver))
-            .with_context(|| format!("failed to spawn render thread for sink {index}"))?;
-        render_threads.push(handle);
-    }
-
-    // Interfaces cannot cross threads (the `windows` crate's COM types are not
-    // Send by design), so each thread re-resolves its endpoint from the ID and
-    // does its own CoInitializeEx.
-    let capture_thread = {
-        let shared = Arc::clone(&shared);
-        thread::Builder::new()
-            .name("lockstep-capture".into())
-            .spawn(move || capture::run(source_id, source_format, shared, feeds))
-            .context("failed to spawn the capture thread")?
-    };
-
+    // The stdin thread only parses; the session lives on this thread, so
+    // parsed actions come back over an ordinary channel and are applied here.
+    // Nothing about this path is real-time, and keeping the Session
+    // single-owner keeps the GUI and CLI stories identical.
+    let (actions_tx, actions_rx) = mpsc::channel::<StdinAction>();
     spawn_stdin_driver(
-        Arc::clone(&shared),
-        command_senders,
-        sample_rate,
-        sink_count,
+        actions_tx,
+        Arc::clone(session.shared()),
+        session.sample_rate(),
+        session.sink_count(),
         // With a duration set the run is unattended and stdin is often a
         // closed pipe. Stopping on EOF would end the session instantly, so
         // only an open-ended run treats end-of-input as "stop".
         config.duration.is_none(),
     );
 
-    let estimators = status_loop(
-        &shared,
-        &plans,
-        sample_rate,
-        config.duration,
-        status_interval,
-    );
+    let estimators = status_loop(&mut session, &actions_rx, config.duration, status_interval);
 
-    shared.request_stop();
-    let _ = capture_thread.join();
-    for handle in render_threads {
-        let _ = handle.join();
+    session.stop();
+
+    print_summary(&session, &estimators);
+
+    let faults = session.faults();
+    for fault in &faults {
+        eprintln!("ERROR: {fault}");
     }
-
-    print_summary(&shared, &plans, &estimators, sample_rate);
-
-    report_faults(&shared, &plans)
-}
-
-/// Reject anything the passthrough path cannot handle, with a message that
-/// names the device and says what is wrong.
-fn validate(device: &DeviceInfo, role: &str) -> Result<MixFormat> {
-    if !device.state.is_active() {
-        bail!(
-            "{role} endpoint [{}] {} is {}, not Active — passthrough needs an active endpoint",
-            device.index,
-            display_name(device),
-            device.state.as_word()
-        );
+    if !faults.is_empty() {
+        bail!("passthrough stopped early because an audio thread faulted");
     }
-
-    let format = device.mix_format.with_context(|| {
-        format!(
-            "{role} endpoint [{}] {} reported no mix format",
-            device.index,
-            display_name(device)
-        )
-    })?;
-
-    if !format.is_f32() {
-        bail!(
-            "{role} endpoint [{}] {} has a {} mix format; this milestone only handles 32-bit \
-             IEEE float, which is what WASAPI shared mode normally provides",
-            device.index,
-            display_name(device),
-            format.summary()
-        );
-    }
-
-    Ok(format)
-}
-
-fn require_matching_formats(
-    source: &DeviceInfo,
-    source_format: MixFormat,
-    sink: &DeviceInfo,
-    sink_format: MixFormat,
-) -> Result<()> {
-    if source_format.sample_rate == sink_format.sample_rate
-        && source_format.channels == sink_format.channels
-    {
-        return Ok(());
-    }
-    bail!(
-        "source and sink mix formats differ and this milestone does no conversion:\n  \
-         source [{}] {}: {}\n  sink   [{}] {}: {}\n\
-         Sample-rate and channel-count conversion arrive with the resampler and downmix stages.",
-        source.index,
-        display_name(source),
-        source_format.summary(),
-        sink.index,
-        display_name(sink),
-        sink_format.summary(),
-    );
-}
-
-fn display_name(device: &DeviceInfo) -> &str {
-    device
-        .friendly_name
-        .as_deref()
-        .unwrap_or("<name unavailable>")
+    Ok(())
 }
 
 fn print_header(
-    config: &PassthroughConfig<'_>,
-    plans: &[SinkPlan],
-    source_id: &str,
-    format: MixFormat,
-    ring_frames: usize,
-    prebuffer_frames: usize,
+    session: &Session,
+    source: &DeviceInfo,
+    duration: Option<Duration>,
     status_interval: Duration,
 ) {
     println!("Lockstep — passthrough");
     println!("======================");
-    println!(
-        "source   [{}] {}",
-        config.source.index,
-        display_name(config.source)
-    );
-    println!("         {source_id}");
-    for (index, plan) in plans.iter().enumerate() {
+    println!("source   [{}] {}", source.index, display_name(source));
+    println!("         {}", session.source_id());
+    for (index, plan) in session.plans().iter().enumerate() {
         println!("sink {index}   {}", plan.label);
         println!("         {}", plan.device_id);
         println!("         delay {:.1} ms at startup", plan.delay_ms);
     }
-    println!("format   {}", format.summary());
+    println!("format   {}", session.format().summary());
     println!(
         "ring     {} ms / {} frames per sink, prebuffer to {} frames ({:.0}%)",
         RING_DURATION_MS,
-        ring_frames,
-        prebuffer_frames,
+        session.ring_frames(),
+        session.prebuffer_frames(),
         PREBUFFER_FRACTION * 100.0
     );
-    match config.duration {
+    match duration {
         Some(d) => println!("run      {:.1} s then stop", d.as_secs_f64()),
         None => println!("run      until Enter is pressed"),
     }
@@ -322,7 +113,7 @@ fn print_header(
     println!("status   every {:.1} s", status_interval.as_secs_f64());
     println!(
         "drift    {}",
-        if config.correction {
+        if session.correction_enabled() {
             "correction ON — PI controller trims the resampler ratio to hold the ring at setpoint"
         } else {
             "correction OFF — ring free-running, drift is left visible"
@@ -331,31 +122,26 @@ fn print_header(
 
     // A sink that is also the source shares the source's clock. Its occupancy
     // must stay flat, which makes it a useful control against the other sink.
-    for (index, plan) in plans.iter().enumerate() {
-        if plan.device_id == source_id {
-            println!();
-            println!("  !! WARNING: sink {index} is the same endpoint as the source.");
-            println!("  !! Loopback capture will re-capture this program's own output, so the");
-            println!("  !! signal path is a feedback loop. With nothing else playing it is a");
-            println!("  !! silence loop and harmless, but any real audio will build on itself.");
-            println!("  !! It does serve as a same-clock control: this sink's ring occupancy");
-            println!("  !! should stay flat while a sink on other hardware drifts.");
-        }
+    if session.source_is_also_a_sink() {
+        println!();
+        println!("  !! WARNING: a sink is the same endpoint as the source.");
+        println!("  !! Loopback capture will re-capture this program's own output, so the");
+        println!("  !! signal path is a feedback loop. With nothing else playing it is a");
+        println!("  !! silence loop and harmless, but any real audio will build on itself.");
+        println!("  !! It does serve as a same-clock control: that sink's ring occupancy");
+        println!("  !! should stay flat while a sink on other hardware drifts.");
     }
     println!();
 }
 
-/// Read operator commands from stdin and push them to the render threads.
+/// Read operator commands from stdin and forward the parsed result.
 ///
-/// This is the stand-in for the GUI. Parsing happens here, on the control
-/// thread, where allocating an error message is free; only the `Copy` command
-/// enum crosses into the audio threads.
-///
-/// Deliberately never joined: it is parked in a blocking read, and the process
-/// exits out from under it once the audio threads are down.
+/// Parsing happens here, on a control thread, where allocating an error message
+/// is free. Deliberately never joined: it is parked in a blocking read, and the
+/// process exits out from under it once the audio threads are down.
 fn spawn_stdin_driver(
+    actions: mpsc::Sender<StdinAction>,
     shared: Arc<SharedState>,
-    mut senders: Vec<rtrb::Producer<Command>>,
     sample_rate: u32,
     sink_count: usize,
     stop_on_eof: bool,
@@ -369,7 +155,6 @@ fn spawn_stdin_driver(
             loop {
                 line.clear();
                 match stdin.read_line(&mut line) {
-                    // End of input.
                     Ok(0) => {
                         if stop_on_eof {
                             shared.request_stop();
@@ -385,69 +170,68 @@ fn spawn_stdin_driver(
                 }
 
                 match parse_line(&line, sink_count, sample_rate) {
-                    Ok(StdinAction::Stop) => {
-                        shared.request_stop();
-                        return;
-                    }
-                    Ok(StdinAction::Send { sink, command }) => {
-                        match senders[sink].push(command) {
-                            Ok(()) => {
-                                let Command::SetDelayFrames(frames) = command;
-                                println!(
-                                    "  -> sink {sink} delay {:.1} ms queued",
-                                    frames as f64 * 1000.0 / f64::from(sample_rate)
-                                );
-                            }
-                            // The audio thread drains every callback, so a full
-                            // queue means it has stalled. Say so rather than
-                            // dropping the change silently.
-                            Err(_) => eprintln!(
-                                "  !! sink {sink} command queue is full; change dropped. The \
-                                 render thread may have stalled."
-                            ),
+                    Ok(action) => {
+                        if actions.send(action).is_err() {
+                            return;
                         }
-                        let _ = std::io::stdout().flush();
+                        if action == StdinAction::Stop {
+                            shared.request_stop();
+                            return;
+                        }
                     }
-                    Err(message) => {
-                        eprintln!("  !! {message}");
-                    }
+                    Err(message) => eprintln!("  !! {message}"),
                 }
             }
         });
 }
 
-/// Print a status block per interval and accumulate the drift fits.
-///
-/// Occupancy is sampled here, on the reporting thread, from atomics the audio
-/// threads publish — no audio thread does any of this arithmetic.
+/// Print a status block per interval, apply queued operator commands, and
+/// accumulate the drift fits.
 fn status_loop(
-    shared: &SharedState,
-    plans: &[SinkPlan],
-    sample_rate: u32,
+    session: &mut Session,
+    actions: &mpsc::Receiver<StdinAction>,
     duration: Option<Duration>,
     status_interval: Duration,
 ) -> Vec<DriftEstimator> {
+    let sample_rate = session.sample_rate();
     // Warm-up must still leave samples behind, so a coarse --status-interval
     // widens it rather than discarding a fixed 10 s worth of nothing.
     let warmup = DRIFT_WARMUP_BASE.max(status_interval * 2);
-    let mut estimators: Vec<DriftEstimator> = plans
-        .iter()
+    let mut estimators: Vec<DriftEstimator> = (0..session.sink_count())
         .map(|_| DriftEstimator::new(sample_rate, warmup))
         .collect();
 
     let start = Instant::now();
     let mut next_status = start + status_interval;
     let mut last_captured = 0u64;
-    let mut last_rendered = vec![0u64; plans.len()];
+    let mut last_rendered = vec![0u64; session.sink_count()];
 
     loop {
-        if shared.should_stop() {
+        if session.should_stop() {
             break;
         }
         if let Some(limit) = duration
             && start.elapsed() >= limit
         {
             break;
+        }
+
+        // Apply anything the operator typed since the last pass.
+        while let Ok(action) = actions.try_recv() {
+            match action {
+                StdinAction::Stop => break,
+                StdinAction::Send { sink, command } => match session.send(sink, command) {
+                    Ok(()) => {
+                        let super::command::Command::SetDelayFrames(frames) = command;
+                        println!(
+                            "  -> sink {sink} delay {:.1} ms queued",
+                            frames as f64 * 1000.0 / f64::from(sample_rate)
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                    Err(error) => eprintln!("  !! sink {sink}: {error}"),
+                },
+            }
         }
 
         let now = Instant::now();
@@ -459,18 +243,21 @@ fn status_loop(
         next_status += status_interval;
 
         let elapsed = start.elapsed().as_secs_f64();
+        let shared = session.shared();
         let captured = shared.frames_captured.load(Ordering::Relaxed);
 
         println!(
-            "t={:7.1}s  captured={:>11} (+{:>7})  pace={}",
+            "t={:7.1}s  captured={:>11} (+{:>7})  pace={}  src={:5.1} dBFS",
             elapsed,
             captured,
             captured.saturating_sub(last_captured),
             shared.pacing().as_str(),
+            dbfs(shared.capture_peak()),
         );
         last_captured = captured;
 
-        for (index, plan) in plans.iter().enumerate() {
+        for index in 0..session.sink_count() {
+            let plan = &session.plans()[index];
             let sink = shared.sink(index);
             let rendered = sink.frames_rendered.load(Ordering::Relaxed);
             let occupancy = sink.ring_occupancy_frames();
@@ -499,7 +286,8 @@ fn status_loop(
 
             println!(
                 "    sink {index} {:<26}  out={:>11} (+{:>7})  ring={:5.1}% ({:>6}/{} fr)  \
-                 under={} ({} fr)  over={} ({} fr)  drift≈ {}  corr={}  delay={:6.1} ms",
+                 under={} ({} fr)  over={} ({} fr)  drift≈ {}  corr={}  delay={:6.1} ms  \
+                 out={:5.1} dBFS{}",
                 truncate(&plan.label, 26),
                 rendered,
                 rendered.saturating_sub(last_rendered[index]),
@@ -513,6 +301,8 @@ fn status_loop(
                 drift_label,
                 correction_label,
                 sink.delay_ms(sample_rate),
+                dbfs(sink.peak()),
+                if sink.is_muted() { "  MUTED" } else { "" },
             );
             last_rendered[index] = rendered;
         }
@@ -520,6 +310,16 @@ fn status_loop(
     }
 
     estimators
+}
+
+/// Linear peak to dBFS, floored so silence prints as a number rather than
+/// negative infinity.
+pub fn dbfs(linear: f32) -> f32 {
+    const FLOOR: f32 = -99.0;
+    if linear <= 0.0 {
+        return FLOOR;
+    }
+    (20.0 * linear.log10()).max(FLOOR)
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -531,16 +331,14 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
-fn print_summary(
-    shared: &SharedState,
-    plans: &[SinkPlan],
-    estimators: &[DriftEstimator],
-    sample_rate: u32,
-) {
+fn print_summary(session: &Session, estimators: &[DriftEstimator]) {
+    let shared = session.shared();
+    let sample_rate = session.sample_rate();
+
     println!();
     println!("summary");
     println!("-------");
-    println!("  sinks              {}", shared.sink_count());
+    println!("  sinks              {}", session.sink_count());
     println!(
         "  frames captured    {}",
         shared.frames_captured.load(Ordering::Relaxed)
@@ -551,7 +349,7 @@ fn print_summary(
         yes_no(shared.capture_mmcss.load(Ordering::Relaxed))
     );
 
-    for (index, plan) in plans.iter().enumerate() {
+    for (index, plan) in session.plans().iter().enumerate() {
         let sink = shared.sink(index);
         println!();
         println!("  sink {index}  {}", plan.label);
@@ -560,6 +358,11 @@ fn print_summary(
             "    delay              {:.1} ms at exit (started at {:.1} ms)",
             sink.delay_ms(sample_rate),
             plan.delay_ms
+        );
+        println!(
+            "    gain / mute        {:.2} linear, {}",
+            sink.gain(),
+            if sink.is_muted() { "MUTED" } else { "unmuted" }
         );
         println!(
             "    frames into ring   {}",
@@ -690,27 +493,6 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
-fn report_faults(shared: &SharedState, plans: &[SinkPlan]) -> Result<()> {
-    let mut faulted = false;
-
-    if let Some(message) = shared.capture_fault.describe("capture thread") {
-        eprintln!("ERROR: {message}");
-        faulted = true;
-    }
-    for (index, plan) in plans.iter().enumerate() {
-        let who = format!("render thread for sink {index} {}", plan.label);
-        if let Some(message) = shared.sink(index).fault.describe(&who) {
-            eprintln!("ERROR: {message}");
-            faulted = true;
-        }
-    }
-
-    if faulted {
-        bail!("passthrough stopped early because an audio thread faulted");
-    }
-    Ok(())
-}
-
 fn yes_no(value: bool) -> &'static str {
     if value {
         "registered"
@@ -722,128 +504,6 @@ fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devices::{EndpointState, ExtensibleFormat};
-    use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM;
-    use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-
-    fn format(sample_rate: u32, channels: u16, float: bool) -> MixFormat {
-        MixFormat {
-            format_tag: 0xFFFE,
-            channels,
-            sample_rate,
-            avg_bytes_per_sec: sample_rate * u32::from(channels) * 4,
-            block_align: channels * 4,
-            bits_per_sample: 32,
-            cb_size: 22,
-            extensible: Some(ExtensibleFormat {
-                valid_bits_per_sample: 32,
-                channel_mask: 0x3,
-                sub_format: if float {
-                    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-                } else {
-                    KSDATAFORMAT_SUBTYPE_PCM
-                },
-            }),
-        }
-    }
-
-    fn device(index: usize, state: EndpointState, mix_format: Option<MixFormat>) -> DeviceInfo {
-        DeviceInfo {
-            index,
-            id: Some(format!("{{0.0.0.00000000}}.{{device-{index}}}")),
-            friendly_name: Some(format!("Device {index}")),
-            state,
-            mix_format,
-            is_default_console: false,
-            is_default_multimedia: false,
-            errors: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn validate_accepts_an_active_float_endpoint() {
-        let d = device(1, EndpointState::Active, Some(format(48_000, 2, true)));
-        let accepted = validate(&d, "sink").expect("an active f32 endpoint is usable");
-        assert_eq!(accepted.sample_rate, 48_000);
-    }
-
-    #[test]
-    fn validate_rejects_every_inactive_state() {
-        for state in [
-            EndpointState::Disabled,
-            EndpointState::NotPresent,
-            EndpointState::Unplugged,
-            EndpointState::Unknown(0x40),
-        ] {
-            let d = device(3, state, Some(format(48_000, 2, true)));
-            let error = validate(&d, "sink").expect_err("inactive endpoints are refused");
-            let message = format!("{error}");
-            assert!(message.contains(state.as_word()), "{message}");
-            assert!(message.contains("not Active"), "{message}");
-            // The message has to identify which device, not just complain.
-            assert!(message.contains("Device 3"), "{message}");
-        }
-    }
-
-    #[test]
-    fn validate_rejects_a_non_float_mix_format() {
-        let d = device(2, EndpointState::Active, Some(format(48_000, 2, false)));
-        let error = validate(&d, "source").expect_err("integer PCM is not handled yet");
-        let message = format!("{error}");
-        assert!(message.contains("non-f32"), "{message}");
-        assert!(message.contains("Device 2"), "{message}");
-    }
-
-    #[test]
-    fn validate_rejects_an_endpoint_with_no_mix_format() {
-        let d = device(4, EndpointState::Active, None);
-        let error = validate(&d, "sink").expect_err("no format means unusable");
-        assert!(format!("{error}").contains("no mix format"));
-    }
-
-    #[test]
-    fn matching_formats_are_accepted() {
-        let source = device(0, EndpointState::Active, None);
-        let sink = device(1, EndpointState::Active, None);
-        let f = format(48_000, 2, true);
-        assert!(require_matching_formats(&source, f, &sink, f).is_ok());
-    }
-
-    #[test]
-    fn a_sample_rate_mismatch_names_both_formats() {
-        let source = device(0, EndpointState::Active, None);
-        let sink = device(1, EndpointState::Active, None);
-        let error = require_matching_formats(
-            &source,
-            format(48_000, 2, true),
-            &sink,
-            format(44_100, 2, true),
-        )
-        .expect_err("rates differ");
-
-        let message = format!("{error}");
-        assert!(message.contains("48000 Hz"), "{message}");
-        assert!(message.contains("44100 Hz"), "{message}");
-        assert!(message.contains("Device 0"), "{message}");
-        assert!(message.contains("Device 1"), "{message}");
-    }
-
-    #[test]
-    fn a_channel_count_mismatch_names_both_formats() {
-        let source = device(0, EndpointState::Active, None);
-        let sink = device(1, EndpointState::Active, None);
-        let error = require_matching_formats(
-            &source,
-            format(48_000, 2, true),
-            &sink,
-            format(48_000, 6, true),
-        )
-        .expect_err("channel counts differ");
-
-        let message = format!("{error}");
-        assert!(message.contains("2 ch"), "{message}");
-        assert!(message.contains("6 ch"), "{message}");
-    }
 
     #[test]
     fn duration_formatting_switches_units_sensibly() {
@@ -868,5 +528,19 @@ mod tests {
         let cut = truncate(name, 8);
         assert_eq!(cut.chars().count(), 8);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn dbfs_maps_the_usual_landmarks() {
+        assert!((dbfs(1.0) - 0.0).abs() < 1e-4);
+        assert!((dbfs(0.5) + 6.02).abs() < 0.01);
+        assert!((dbfs(0.1) + 20.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn dbfs_floors_silence_instead_of_returning_infinity() {
+        assert_eq!(dbfs(0.0), -99.0);
+        assert_eq!(dbfs(-0.5), -99.0);
+        assert!(dbfs(1e-30) >= -99.0);
     }
 }

@@ -7,9 +7,11 @@ pub mod control;
 pub mod delay;
 pub mod drift;
 pub mod frames;
+pub mod level;
 pub mod passthrough;
 pub mod render;
 pub mod rt;
+pub mod session;
 pub mod staging;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -254,6 +256,19 @@ pub struct SinkState {
     /// thread each callback so the status line can show runtime changes.
     delay_frames: AtomicU64,
 
+    /// Output gain, 0.0–1.0 linear, as `f32` bits.
+    ///
+    /// An `f32` in an `AtomicU32` because there is no `AtomicF32`. This is a
+    /// *value*, not a transition — a missed intermediate is invisible — so per
+    /// CLAUDE.md it is an atomic and deliberately not a queued command.
+    gain_bits: AtomicU32,
+    /// Output mute. Same reasoning as `gain_bits`.
+    pub mute: AtomicBool,
+    /// Peak absolute sample of the most recent rendered block, as `f32` bits.
+    /// Measured after gain, so it shows what actually left the machine.
+    /// Decay and peak-hold are the display's job, not the audio thread's.
+    peak_bits: AtomicU32,
+
     ring_frames: u64,
 }
 
@@ -279,6 +294,9 @@ impl SinkState {
             correction_enabled: AtomicBool::new(false),
             asrc_latency_frames: AtomicU64::new(0),
             delay_frames: AtomicU64::new(0),
+            gain_bits: AtomicU32::new(1.0f32.to_bits()),
+            mute: AtomicBool::new(false),
+            peak_bits: AtomicU32::new(0),
             ring_frames,
         }
     }
@@ -347,6 +365,40 @@ impl SinkState {
         self.delay_frames() as f64 * 1000.0 / f64::from(sample_rate)
     }
 
+    /// Output gain, 0.0–1.0 linear.
+    pub fn gain(&self) -> f32 {
+        f32::from_bits(self.gain_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+    }
+
+    pub fn set_gain(&self, gain: f32) {
+        self.gain_bits
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.mute.load(Ordering::Relaxed)
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.mute.store(muted, Ordering::Relaxed);
+    }
+
+    /// The gain the render thread should actually apply: zero when muted.
+    ///
+    /// Muting through the same ramp as gain is what keeps it click-free.
+    pub fn effective_gain(&self) -> f32 {
+        if self.is_muted() { 0.0 } else { self.gain() }
+    }
+
+    /// Peak of the most recent rendered block, linear 0.0–1.0+.
+    pub fn peak(&self) -> f32 {
+        f32::from_bits(self.peak_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn publish_peak(&self, peak: f32) {
+        self.peak_bits.store(peak.to_bits(), Ordering::Relaxed);
+    }
+
     pub fn ring_frames(&self) -> u64 {
         self.ring_frames
     }
@@ -392,6 +444,9 @@ pub struct SharedState {
     pub capture_mmcss: AtomicBool,
     pub capture_fault: FaultSlot,
     pacing: AtomicU32,
+    /// Peak of the most recent captured packet, as `f32` bits — the source
+    /// meter. One per session, because there is one capture stream.
+    capture_peak_bits: AtomicU32,
 
     /// Preallocated for `MAX_SINKS`; only the first `sink_count` are live. A
     /// fixed array means the capture thread's fan-out loop never touches the
@@ -417,6 +472,7 @@ impl SharedState {
             capture_mmcss: AtomicBool::new(false),
             capture_fault: FaultSlot::default(),
             pacing: AtomicU32::new(CapturePacing::Undetermined.code()),
+            capture_peak_bits: AtomicU32::new(0),
             sinks: std::array::from_fn(|_| SinkState::new(ring_frames)),
             sink_count: sink_count.min(MAX_SINKS),
         }
@@ -434,10 +490,6 @@ impl SharedState {
         &self.sinks[index]
     }
 
-    pub fn sink_count(&self) -> usize {
-        self.sink_count
-    }
-
     pub fn should_stop(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
@@ -452,6 +504,16 @@ impl SharedState {
 
     pub fn pacing(&self) -> CapturePacing {
         CapturePacing::from_code(self.pacing.load(Ordering::Relaxed))
+    }
+
+    /// Peak of the most recent captured packet, linear.
+    pub fn capture_peak(&self) -> f32 {
+        f32::from_bits(self.capture_peak_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn publish_capture_peak(&self, peak: f32) {
+        self.capture_peak_bits
+            .store(peak.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -608,7 +670,11 @@ mod tests {
         // More than two outputs is an explicit non-goal, so an over-large
         // request is clamped rather than silently indexing out of bounds.
         let shared = SharedState::new(MAX_SINKS + 5, 24_000);
-        assert_eq!(shared.sink_count(), MAX_SINKS);
+        assert_eq!(shared.sink_count, MAX_SINKS);
+        // And the clamp means indexing every live sink stays in bounds.
+        for index in 0..shared.sink_count {
+            let _ = shared.sink(index);
+        }
     }
 
     #[test]

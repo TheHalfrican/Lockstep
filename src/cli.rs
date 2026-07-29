@@ -10,14 +10,16 @@ pub const USAGE: &str = "\
 Lockstep — Windows dual-output audio router
 
 USAGE:
-    lockstep [list]
+    lockstep                       Open the window
+    lockstep list
     lockstep play --sink <index|id> [--sink <index|id>] [--source <index|id>]
                   [--delay <ms>]... [--duration <secs>] [--status-interval <secs>]
                   [--no-correction]
     lockstep help
 
 COMMANDS:
-    list      Report every render endpoint with its ID and mix format (default)
+    gui       Open the window (the default when no command is given)
+    list      Report every render endpoint with its ID and mix format
     play      Loopback-capture the source endpoint and render it to the sinks
 
 OPTIONS:
@@ -44,6 +46,7 @@ While `play` is running, type commands on stdin:
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
+    Gui,
     List,
     Play(PlayArgs),
     Help,
@@ -68,11 +71,19 @@ pub struct PlayArgs {
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
     let mut args = args.into_iter();
 
+    // Bare `lockstep` opens the window: the GUI is the product, the CLI is the
+    // instrument. `list` still has to be asked for by name.
     let Some(first) = args.next() else {
-        return Ok(Command::List);
+        return Ok(Command::Gui);
     };
 
     match first.as_str() {
+        "gui" => {
+            if let Some(extra) = args.next() {
+                bail!("`gui` takes no arguments, got `{extra}`");
+            }
+            Ok(Command::Gui)
+        }
         "list" => {
             if let Some(extra) = args.next() {
                 bail!("`list` takes no arguments, got `{extra}`");
@@ -164,9 +175,16 @@ mod tests {
     }
 
     #[test]
-    fn no_args_lists() {
-        assert_eq!(parse_str(&[]).unwrap(), Command::List);
+    fn no_args_opens_the_window() {
+        assert_eq!(parse_str(&[]).unwrap(), Command::Gui);
+        assert_eq!(parse_str(&["gui"]).unwrap(), Command::Gui);
+    }
+
+    #[test]
+    fn list_still_has_to_be_asked_for_by_name() {
         assert_eq!(parse_str(&["list"]).unwrap(), Command::List);
+        assert!(parse_str(&["list", "extra"]).is_err());
+        assert!(parse_str(&["gui", "extra"]).is_err());
     }
 
     #[test]

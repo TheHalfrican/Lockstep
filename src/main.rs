@@ -1,11 +1,17 @@
 //! Lockstep — a minimal Windows audio router.
 //!
-//! Milestone 2: endpoint enumeration plus single-output passthrough
-//! (loopback capture on one render endpoint, rendered to another).
+//! One source, up to two outputs, with per-output delay and drift correction.
+//! `lockstep` on its own opens the window; `list` and `play` are the
+//! command-line paths onto the same engine.
+
+// Windows subsystem: no console window behind the GUI in a release build.
+// Debug builds keep the console so `list` and `play` still print.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
 mod cli;
 mod devices;
+mod gui;
 
 use std::time::Duration;
 
@@ -55,6 +61,7 @@ fn run() -> Result<()> {
         }
         Command::List => list(),
         Command::Play(args) => play(args),
+        Command::Gui => gui::run(),
     }
 }
 

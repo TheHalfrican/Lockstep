@@ -39,6 +39,7 @@ use super::command::Command;
 use super::control::{ControllerConfig, DriftController};
 use super::delay::{DelayLine, MAX_DELAY_MS, ms_to_frames};
 use super::frames::{frames_to_move, gather_interleaved, pad_with_silence, whole_frames};
+use super::level::GainRamp;
 use super::rt::{ActivatedClient, ComApartment, EventHandle, MmcssRegistration, WaitOutcome};
 use super::staging::SampleFifo;
 use super::{FaultStage, SharedState, SinkState};
@@ -504,6 +505,10 @@ fn setup_and_run(
         };
         sink.set_delay_frames(delay.line.delay_frames() as u64);
 
+        // Starts at the gain already selected, so opening a session on a
+        // pre-set fader does not ramp up from silence.
+        let mut gain = GainRamp::new(format.sample_rate, sink.effective_gain());
+
         // Prebuffer before starting, so the very first callbacks have data.
         // Sleeping here is fine: the stream is not running yet, so the
         // no-blocking rule does not apply.
@@ -601,6 +606,7 @@ fn setup_and_run(
                         sink,
                         stage,
                         &mut delay,
+                        &mut gain,
                         consumer,
                         available,
                         channels,
@@ -612,6 +618,7 @@ fn setup_and_run(
                     &render_client,
                     sink,
                     &mut delay,
+                    &mut gain,
                     consumer,
                     available,
                     channels,
@@ -641,10 +648,12 @@ fn setup_and_run(
 /// # Safety
 ///
 /// Caller must hold an initialized render client on a COM-initialized thread.
+#[allow(clippy::too_many_arguments)]
 unsafe fn write_period(
     render_client: &IAudioRenderClient,
     sink: &SinkState,
     delay: &mut DelayStage,
+    gain: &mut GainRamp,
     consumer: &mut Consumer<f32>,
     frames: u32,
     channels: usize,
@@ -695,6 +704,8 @@ unsafe fn write_period(
             pad_with_silence(dst, written_samples);
         }
 
+        finish_block(dst, sink, gain, channels);
+
         if let Err(err) = render_client.ReleaseBuffer(frames, 0) {
             sink.fault.record(FaultStage::ReleaseBuffer, err.code());
             return Err(());
@@ -722,6 +733,7 @@ unsafe fn write_resampled(
     sink: &SinkState,
     stage: &mut ResampleStage,
     delay: &mut DelayStage,
+    gain: &mut GainRamp,
     consumer: &mut Consumer<f32>,
     frames: u32,
     channels: usize,
@@ -775,6 +787,8 @@ unsafe fn write_resampled(
             pad_with_silence(dst, written_samples);
         }
 
+        finish_block(dst, sink, gain, channels);
+
         if let Err(err) = render_client.ReleaseBuffer(frames, 0) {
             sink.fault.record(FaultStage::ReleaseBuffer, err.code());
             return Err(());
@@ -784,6 +798,15 @@ unsafe fn write_resampled(
             .fetch_add(wanted_frames as u64, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// Apply gain and mute to a finished block and publish its peak.
+///
+/// The last thing that touches the audio, after delay and resampling, so a
+/// gain or mute change lands on the very next block with no added latency.
+fn finish_block(dst: &mut [f32], sink: &SinkState, gain: &mut GainRamp, channels: usize) {
+    let peak = gain.process(dst, channels, sink.effective_gain());
+    sink.publish_peak(peak);
 }
 
 /// Fill `frames` of the endpoint buffer with silence, leaving the ring alone.

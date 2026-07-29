@@ -296,6 +296,20 @@ unsafe fn drain_packets(
                     .frames_captured
                     .fetch_add(u64::from(frames), Ordering::Relaxed);
 
+                // Source meter. A SILENT packet's contents are undefined, so it
+                // reads as zero rather than as whatever was in the buffer.
+                let packet_peak = if silent {
+                    0.0
+                } else {
+                    // SAFETY: as in the fan-out below — WASAPI guarantees the
+                    // packet covers the frames it reported.
+                    super::level::peak(std::slice::from_raw_parts(
+                        data.cast::<f32>(),
+                        frames as usize * channels,
+                    ))
+                };
+                shared.publish_capture_peak(packet_peak);
+
                 // Fan out. Each sink is served independently so a full ring on
                 // one output cannot cost the other output any frames.
                 for (index, feed) in feeds.iter_mut().enumerate() {

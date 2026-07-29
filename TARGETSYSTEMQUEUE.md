@@ -23,7 +23,7 @@ cargo build
 cargo test
 ```
 
-All 16 tests should pass before anything else is trusted.
+All tests (223 as of milestone 7) should pass before anything else is trusted.
 
 ---
 
@@ -101,6 +101,25 @@ cargo run -- play --source <music endpoint ID> --sink <other endpoint ID> --dura
 - [ ] Note the subjective latency between source and sink playback — this is a
       preview of what the delay lines must compensate
 - [ ] Repeat with the roles swapped
+
+## 4b. GUI shakedown (milestone 7 on real hardware)
+
+`cargo run` with no arguments launches the window. First time the GUI meets
+real audio and real device names:
+
+- [ ] Device combos: both Astro endpoints listed — do the friendly names
+      collide or near-collide as predicted? (Hover shows the ID.) Does the
+      right one stay selected across a Refresh?
+- [ ] Start a home-theater-shaped session (A50X + HDMI), play music: meters
+      move sensibly with the material, peak-hold behaves, no GUI stutter
+- [ ] Drag the delay slider on one output while listening — this is the first
+      audible test of the crossfade. It should sound like the delay smoothly
+      changing, never clicking or crackling, even dragged fast
+- [ ] Gain slider and mute: no zipper noise, mute is instant but click-free
+- [ ] Correction readout: settles and sits steady; CLAMPED flag never shows
+- [ ] Stop, reconfigure, Start again — restart must work without relaunching
+- [ ] Note subjective input-feel latency with the headset delayed vs undelayed
+      (the aligned-vs-unaligned trade CLAUDE.md says to expose)
 
 ## 5. Drift measurement — the PI tuning baseline
 

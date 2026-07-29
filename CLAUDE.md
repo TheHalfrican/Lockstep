@@ -89,9 +89,11 @@ WASAPI loopback capture (source endpoint)
 
 ### Threads
 
-- **Capture thread** — one, event-driven WASAPI loopback on the source render endpoint
+- **Capture thread** — one, WASAPI loopback on the source render endpoint. Event-driven *when the endpoint cooperates*: measured on real hardware, the loopback event handle is intermittently never-signaled (fired in some runs, silent in others, same device — the old MSDN warning is alive, at least on Bluetooth). The capture thread tries events and falls back to timer-paced polling; both paths share one drain loop and are load-bearing.
 - **Render threads** — one per output, event-driven, fully independent
 - **GUI thread** — `eframe`, never blocks and is never blocked by audio threads
+
+Two hardware truths, measured, that the code is designed around: **an idle endpoint produces no loopback data at all** — not silence, nothing — until something renders to it, which is why render threads prime their endpoint with silence (without draining the ring) until occupancy reaches setpoint. And **winit's drag-and-drop support initializes OLE, which demands an STA** and panics against the MTA WASAPI needs; drag-and-drop is disabled in the viewport (`with_drag_and_drop(false)`) — do not re-enable it.
 
 Each audio thread calls `CoInitializeEx(COINIT_MULTITHREADED)` for itself. COM apartment state is per-thread; a single initialization in `main` is not sufficient and will produce confusing failures.
 

@@ -31,7 +31,7 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, STGM_READ,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
-use windows::core::GUID;
+use windows::core::{GUID, HSTRING};
 
 /// Endpoint lifecycle state, as reported by `IMMDevice::GetState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,32 @@ impl MixFormat {
             _ => "unrecognized wFormatTag",
         }
     }
+
+    /// True when samples are 32-bit IEEE floats, which is what every WASAPI
+    /// shared-mode mix uses and the only layout the passthrough path handles.
+    pub fn is_f32(&self) -> bool {
+        if self.bits_per_sample != 32 {
+            return false;
+        }
+        match &self.extensible {
+            Some(ext) => ext.sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+            // 3 == WAVE_FORMAT_IEEE_FLOAT, for the non-extensible case.
+            None => self.format_tag == 3,
+        }
+    }
+
+    /// Compact one-line rendering, used in "formats don't match" errors.
+    pub fn summary(&self) -> String {
+        let sample_type = if self.is_f32() { "f32" } else { "non-f32" };
+        format!(
+            "{} Hz, {} ch, {}-bit {} ({})",
+            self.sample_rate,
+            self.channels,
+            self.bits_per_sample,
+            sample_type,
+            self.container_name()
+        )
+    }
 }
 
 /// Everything known about one render endpoint.
@@ -238,6 +264,48 @@ pub fn enumerate_render_endpoints() -> Result<Vec<DeviceInfo>> {
 
         Ok(devices)
     }
+}
+
+/// Look up a single render endpoint by its `IMMDevice::GetId()` string.
+///
+/// Used by the audio threads, which cannot be handed COM interfaces from the
+/// main thread (the `windows` crate's interface types are deliberately not
+/// `Send`) and so re-resolve their endpoint from the ID after doing their own
+/// `CoInitializeEx`. The ID is the stable handle for exactly this reason.
+///
+/// # Safety
+///
+/// Caller must be on a COM-initialized thread.
+pub unsafe fn open_device_by_id(id: &str) -> Result<IMMDevice> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER)
+                .context("CoCreateInstance(MMDeviceEnumerator) failed")?;
+        enumerator
+            .GetDevice(&HSTRING::from(id))
+            .with_context(|| format!("IMMDeviceEnumerator::GetDevice failed for id {id}"))
+    }
+}
+
+/// Resolve a user-supplied `--source`/`--sink` argument against an enumeration.
+///
+/// Accepts either the bracketed index from the `list` report or a verbatim
+/// device ID. Bare integers are tried as an index first; every real WASAPI ID
+/// starts with `{`, so the two namespaces cannot collide.
+pub fn resolve_spec<'a>(devices: &'a [DeviceInfo], spec: &str) -> Result<&'a DeviceInfo> {
+    if let Ok(index) = spec.parse::<usize>() {
+        return devices.get(index).with_context(|| {
+            format!(
+                "no endpoint with index {index}; `lockstep list` reported {} endpoint(s)",
+                devices.len()
+            )
+        });
+    }
+
+    devices
+        .iter()
+        .find(|d| d.id.as_deref() == Some(spec))
+        .with_context(|| format!("no render endpoint with id {spec}; run `lockstep list`"))
 }
 
 /// Resolve the default endpoint for `role` to its device ID string.
@@ -433,6 +501,24 @@ unsafe fn mix_format(device: &IMMDevice) -> Result<MixFormat> {
             anyhow::bail!("IAudioClient::GetMixFormat returned a null format");
         }
 
+        let format = decode_wave_format(ptr);
+        CoTaskMemFree(Some(ptr.cast()));
+        Ok(format)
+    }
+}
+
+/// Copy a `WAVEFORMATEX` — and its extensible tail, if present — into owned data.
+///
+/// Does not take ownership of `ptr`; freeing it stays the caller's job. The
+/// audio threads use this to inspect the format they must hand straight back to
+/// `IAudioClient::Initialize`, which needs the original allocation intact.
+///
+/// # Safety
+///
+/// `ptr` must point to a valid `WAVEFORMATEX` with at least `cbSize` further
+/// bytes readable after it.
+pub unsafe fn decode_wave_format(ptr: *const WAVEFORMATEX) -> MixFormat {
+    unsafe {
         // WAVEFORMATEX is `#[repr(packed)]`, so it is read as a whole and its
         // fields copied out by value; taking a reference to a packed field is
         // not allowed.
@@ -452,9 +538,7 @@ unsafe fn mix_format(device: &IMMDevice) -> Result<MixFormat> {
                 None
             };
 
-        CoTaskMemFree(Some(ptr.cast()));
-
-        Ok(MixFormat {
+        MixFormat {
             format_tag: base.wFormatTag,
             channels: base.nChannels,
             sample_rate: base.nSamplesPerSec,
@@ -463,6 +547,6 @@ unsafe fn mix_format(device: &IMMDevice) -> Result<MixFormat> {
             bits_per_sample: base.wBitsPerSample,
             cb_size: base.cbSize,
             extensible,
-        })
+        }
     }
 }

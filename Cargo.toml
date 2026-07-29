@@ -5,12 +5,18 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+# Lock-free SPSC ring between the capture thread and the render thread.
+rtrb = "0.3.4"
 
 [dependencies.windows]
 version = "0.62.2"
 features = [
-    # PROPERTYKEY, HRESULT plumbing
+    # PROPERTYKEY, HRESULT plumbing, HANDLE, WAIT_*, CloseHandle
     "Win32_Foundation",
+    # CreateEventW, WaitForSingleObject, AvSetMmThreadCharacteristicsW (MMCSS)
+    "Win32_System_Threading",
+    # SECURITY_ATTRIBUTES — only present to satisfy the CreateEventW feature gate
+    "Win32_Security",
     # IMMDeviceEnumerator, IMMDevice, IAudioClient, WAVEFORMATEX(TENSIBLE)
     "Win32_Media_Audio",
     # SPEAKER_* channel-mask bits, WAVE_FORMAT_EXTENSIBLE, KSDATAFORMAT_SUBTYPE_PCM

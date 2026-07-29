@@ -1,9 +1,16 @@
-//! Lockstep — milestone 1: enumerate render endpoints and report their IDs and
-//! mix formats.
+//! Lockstep — a minimal Windows audio router.
+//!
+//! Milestone 2: endpoint enumeration plus single-output passthrough
+//! (loopback capture on one render endpoint, rendered to another).
 
+mod audio;
+mod cli;
 mod devices;
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use cli::{Command, PlayArgs};
 use devices::DeviceInfo;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
@@ -41,6 +48,17 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
+    match cli::parse(std::env::args().skip(1))? {
+        Command::Help => {
+            println!("{}", cli::USAGE);
+            Ok(())
+        }
+        Command::List => list(),
+        Command::Play(args) => play(args),
+    }
+}
+
+fn list() -> Result<()> {
     let devices = devices::enumerate_render_endpoints()
         .context("failed to enumerate WASAPI render endpoints")?;
 
@@ -56,6 +74,32 @@ fn run() -> Result<()> {
     println!("{active} of {} endpoint(s) active", devices.len());
 
     Ok(())
+}
+
+fn play(args: PlayArgs) -> Result<()> {
+    let devices = devices::enumerate_render_endpoints()
+        .context("failed to enumerate WASAPI render endpoints")?;
+
+    let sink = devices::resolve_spec(&devices, &args.sink)
+        .with_context(|| format!("could not resolve --sink `{}`", args.sink))?;
+
+    // Without --source, capture whatever Windows is currently sending sound to.
+    // Console rather than Multimedia: it is the role that follows the user's
+    // "default device" choice in Sound settings.
+    let source = match &args.source {
+        Some(spec) => devices::resolve_spec(&devices, spec)
+            .with_context(|| format!("could not resolve --source `{spec}`"))?,
+        None => devices
+            .iter()
+            .find(|d| d.is_default_console)
+            .context("no default Console render endpoint; pass --source explicitly")?,
+    };
+
+    audio::passthrough::run(audio::passthrough::PassthroughConfig {
+        source,
+        sink,
+        duration: args.duration_secs.map(Duration::from_secs_f64),
+    })
 }
 
 fn print_device(device: &DeviceInfo) {

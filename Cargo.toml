@@ -1,0 +1,39 @@
+[package]
+name = "lockstep"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    # PROPERTYKEY, HRESULT plumbing
+    "Win32_Foundation",
+    # IMMDeviceEnumerator, IMMDevice, IAudioClient, WAVEFORMATEX(TENSIBLE)
+    "Win32_Media_Audio",
+    # SPEAKER_* channel-mask bits, WAVE_FORMAT_EXTENSIBLE, KSDATAFORMAT_SUBTYPE_PCM
+    "Win32_Media_KernelStreaming",
+    # KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+    "Win32_Media_Multimedia",
+    # PKEY_Device_FriendlyName
+    "Win32_Devices_FunctionDiscovery",
+    # CoInitializeEx, CoCreateInstance, CoTaskMemFree, STGM_READ
+    "Win32_System_Com",
+    # PROPVARIANT, PropVariantClear
+    "Win32_System_Com_StructuredStorage",
+    # VARENUM / VT_LPWSTR (PROPVARIANT discriminant)
+    "Win32_System_Variant",
+    # IPropertyStore
+    "Win32_UI_Shell_PropertiesSystem",
+]
+
+# Keep the local crate cheap to debug while compiling dependencies optimized.
+# Without this, debug-mode `rubato` (added in a later milestone) misses its
+# deadline and produces underruns that look like drift-correction bugs.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

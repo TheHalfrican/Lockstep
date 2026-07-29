@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rtrb::RingBuffer;
 
+use super::command::{Command, StdinAction, pair_delays, parse_line};
 use super::drift::DriftEstimator;
+use super::render::RenderConfig;
 use super::{MAX_SINKS, SharedState, SinkState, capture, render};
 use crate::devices::{DeviceInfo, MixFormat};
 
@@ -38,6 +40,15 @@ const RING_DURATION_MS: u64 = 500;
 const PREBUFFER_FRACTION: f64 = 0.5;
 
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Command queue depth, per sink.
+///
+/// The render thread drains to empty every callback — about 100 times a second
+/// — so this only has to absorb a burst arriving between two drains. A human
+/// typing cannot fill it and a 60 Hz GUI slider would need the audio thread to
+/// stall for most of a second. Sized generously anyway because the memory is
+/// nothing and a dropped parameter change is a confusing bug to chase.
+const COMMAND_QUEUE_DEPTH: usize = 64;
 
 /// Occupancy samples inside this window after the first reading are discarded
 /// from the drift fit: the ring is still settling from prebuffer and the
@@ -53,12 +64,16 @@ pub struct PassthroughConfig<'a> {
     /// Whether each render thread runs its ASRC and PI controller. Off leaves
     /// the ring free-running, which is how uncorrected drift is measured.
     pub correction: bool,
+    /// Startup delays in milliseconds, paired positionally with `sinks`.
+    /// Shorter than `sinks` is fine; the rest default to zero.
+    pub delays_ms: &'a [f64],
 }
 
 /// A sink resolved and ready to run.
 struct SinkPlan {
     label: String,
     device_id: String,
+    delay_ms: f64,
 }
 
 pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
@@ -72,8 +87,10 @@ pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
         bail!("at most {MAX_SINKS} sinks are supported, got {sink_count}");
     }
 
+    let delays = pair_delays(sink_count, config.delays_ms).map_err(anyhow::Error::msg)?;
+
     let mut plans: Vec<SinkPlan> = Vec::with_capacity(sink_count);
-    for sink in config.sinks {
+    for (position, sink) in config.sinks.iter().enumerate() {
         let sink_format = validate(sink, "sink")?;
         require_matching_formats(config.source, source_format, sink, sink_format)?;
 
@@ -100,6 +117,7 @@ pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
         plans.push(SinkPlan {
             label: format!("[{}] {}", sink.index, display_name(sink)),
             device_id,
+            delay_ms: delays[position],
         });
     }
 
@@ -132,27 +150,31 @@ pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
     // array; each consumer goes to its own render thread.
     let mut feeds: capture::SinkFeeds = [const { None }; MAX_SINKS];
     let mut render_threads = Vec::with_capacity(sink_count);
+    // Producer ends of the parameter queues, handed to the control thread.
+    let mut command_senders = Vec::with_capacity(sink_count);
 
     for (index, plan) in plans.iter().enumerate() {
         let (producer, consumer) = RingBuffer::<f32>::new(ring_samples);
         feeds[index] = Some(producer);
 
+        // One command queue per render thread: single producer on the control
+        // side, single consumer on the audio side, which is exactly what rtrb
+        // is for.
+        let (sender, receiver) = RingBuffer::<Command>::new(COMMAND_QUEUE_DEPTH);
+        command_senders.push(sender);
+
         let shared = Arc::clone(&shared);
-        let device_id = plan.device_id.clone();
-        let correction = config.correction;
+        let render_config = RenderConfig {
+            device_id: plan.device_id.clone(),
+            format: source_format,
+            prebuffer_frames,
+            sink_index: index,
+            correction: config.correction,
+            delay_ms: plan.delay_ms,
+        };
         let handle = thread::Builder::new()
             .name(format!("lockstep-render-{index}"))
-            .spawn(move || {
-                render::run(
-                    device_id,
-                    source_format,
-                    prebuffer_frames,
-                    index,
-                    correction,
-                    shared,
-                    consumer,
-                )
-            })
+            .spawn(move || render::run(render_config, shared, consumer, receiver))
             .with_context(|| format!("failed to spawn render thread for sink {index}"))?;
         render_threads.push(handle);
     }
@@ -168,9 +190,16 @@ pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
             .context("failed to spawn the capture thread")?
     };
 
-    if config.duration.is_none() {
-        spawn_enter_watcher(Arc::clone(&shared));
-    }
+    spawn_stdin_driver(
+        Arc::clone(&shared),
+        command_senders,
+        sample_rate,
+        sink_count,
+        // With a duration set the run is unattended and stdin is often a
+        // closed pipe. Stopping on EOF would end the session instantly, so
+        // only an open-ended run treats end-of-input as "stop".
+        config.duration.is_none(),
+    );
 
     let estimators = status_loop(
         &shared,
@@ -186,7 +215,7 @@ pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
         let _ = handle.join();
     }
 
-    print_summary(&shared, &plans, &estimators);
+    print_summary(&shared, &plans, &estimators, sample_rate);
 
     report_faults(&shared, &plans)
 }
@@ -275,6 +304,7 @@ fn print_header(
     for (index, plan) in plans.iter().enumerate() {
         println!("sink {index}   {}", plan.label);
         println!("         {}", plan.device_id);
+        println!("         delay {:.1} ms at startup", plan.delay_ms);
     }
     println!("format   {}", format.summary());
     println!(
@@ -288,6 +318,7 @@ fn print_header(
         Some(d) => println!("run      {:.1} s then stop", d.as_secs_f64()),
         None => println!("run      until Enter is pressed"),
     }
+    println!("commands `delay <sink-index> <ms>` on stdin, `quit` to stop");
     println!("status   every {:.1} s", status_interval.as_secs_f64());
     println!(
         "drift    {}",
@@ -314,17 +345,74 @@ fn print_header(
     println!();
 }
 
-/// Watch stdin for Enter and ask the session to stop.
+/// Read operator commands from stdin and push them to the render threads.
+///
+/// This is the stand-in for the GUI. Parsing happens here, on the control
+/// thread, where allocating an error message is free; only the `Copy` command
+/// enum crosses into the audio threads.
 ///
 /// Deliberately never joined: it is parked in a blocking read, and the process
 /// exits out from under it once the audio threads are down.
-fn spawn_enter_watcher(shared: Arc<SharedState>) {
+fn spawn_stdin_driver(
+    shared: Arc<SharedState>,
+    mut senders: Vec<rtrb::Producer<Command>>,
+    sample_rate: u32,
+    sink_count: usize,
+    stop_on_eof: bool,
+) {
     let _ = thread::Builder::new()
         .name("lockstep-stdin".into())
         .spawn(move || {
+            let stdin = std::io::stdin();
             let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
-            shared.request_stop();
+
+            loop {
+                line.clear();
+                match stdin.read_line(&mut line) {
+                    // End of input.
+                    Ok(0) => {
+                        if stop_on_eof {
+                            shared.request_stop();
+                        }
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+
+                if shared.should_stop() {
+                    return;
+                }
+
+                match parse_line(&line, sink_count, sample_rate) {
+                    Ok(StdinAction::Stop) => {
+                        shared.request_stop();
+                        return;
+                    }
+                    Ok(StdinAction::Send { sink, command }) => {
+                        match senders[sink].push(command) {
+                            Ok(()) => {
+                                let Command::SetDelayFrames(frames) = command;
+                                println!(
+                                    "  -> sink {sink} delay {:.1} ms queued",
+                                    frames as f64 * 1000.0 / f64::from(sample_rate)
+                                );
+                            }
+                            // The audio thread drains every callback, so a full
+                            // queue means it has stalled. Say so rather than
+                            // dropping the change silently.
+                            Err(_) => eprintln!(
+                                "  !! sink {sink} command queue is full; change dropped. The \
+                                 render thread may have stalled."
+                            ),
+                        }
+                        let _ = std::io::stdout().flush();
+                    }
+                    Err(message) => {
+                        eprintln!("  !! {message}");
+                    }
+                }
+            }
         });
 }
 
@@ -411,7 +499,7 @@ fn status_loop(
 
             println!(
                 "    sink {index} {:<26}  out={:>11} (+{:>7})  ring={:5.1}% ({:>6}/{} fr)  \
-                 under={} ({} fr)  over={} ({} fr)  drift≈ {}  corr={}",
+                 under={} ({} fr)  over={} ({} fr)  drift≈ {}  corr={}  delay={:6.1} ms",
                 truncate(&plan.label, 26),
                 rendered,
                 rendered.saturating_sub(last_rendered[index]),
@@ -424,6 +512,7 @@ fn status_loop(
                 sink.overrun_frames.load(Ordering::Relaxed),
                 drift_label,
                 correction_label,
+                sink.delay_ms(sample_rate),
             );
             last_rendered[index] = rendered;
         }
@@ -442,7 +531,12 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
-fn print_summary(shared: &SharedState, plans: &[SinkPlan], estimators: &[DriftEstimator]) {
+fn print_summary(
+    shared: &SharedState,
+    plans: &[SinkPlan],
+    estimators: &[DriftEstimator],
+    sample_rate: u32,
+) {
     println!();
     println!("summary");
     println!("-------");
@@ -462,6 +556,11 @@ fn print_summary(shared: &SharedState, plans: &[SinkPlan], estimators: &[DriftEs
         println!();
         println!("  sink {index}  {}", plan.label);
         println!("    {}", plan.device_id);
+        println!(
+            "    delay              {:.1} ms at exit (started at {:.1} ms)",
+            sink.delay_ms(sample_rate),
+            plan.delay_ms
+        );
         println!(
             "    frames into ring   {}",
             sink.frames_pushed.load(Ordering::Relaxed)

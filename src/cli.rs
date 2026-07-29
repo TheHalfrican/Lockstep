@@ -12,7 +12,8 @@ Lockstep — Windows dual-output audio router
 USAGE:
     lockstep [list]
     lockstep play --sink <index|id> [--sink <index|id>] [--source <index|id>]
-                  [--duration <secs>] [--status-interval <secs>] [--no-correction]
+                  [--delay <ms>]... [--duration <secs>] [--status-interval <secs>]
+                  [--no-correction]
     lockstep help
 
 COMMANDS:
@@ -24,6 +25,9 @@ OPTIONS:
                                second simultaneous output (two is the maximum).
     --source <index|id>        Endpoint to capture. Defaults to the current
                                default Console render endpoint.
+    --delay <ms>               Output delay, 0-250 ms. Repeatable: the first
+                               --delay pairs with the first --sink, the second
+                               with the second. Sinks with no --delay get 0.
     --duration <secs>          Stop after this long. Without it, runs until Enter.
     --status-interval <secs>   Seconds between status lines. Default 1.
     --no-correction            Disable drift correction. The ring is left to
@@ -32,7 +36,11 @@ OPTIONS:
 
 Indices are the bracketed numbers from `lockstep list`; IDs are the verbatim
 device ID strings from the same report. IDs are stable across reboots and
-renames, indices are not — prefer IDs for anything scripted.";
+renames, indices are not — prefer IDs for anything scripted.
+
+While `play` is running, type commands on stdin:
+    delay <sink-index> <ms>    Change a sink's delay, crossfaded over 10 ms
+    quit                       Stop (a bare Enter does the same)";
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -47,6 +55,8 @@ pub struct PlayArgs {
     pub source: Option<String>,
     /// One or two output endpoints, in the order given.
     pub sinks: Vec<String>,
+    /// Startup delays in milliseconds, paired positionally with `sinks`.
+    pub delays_ms: Vec<f64>,
     pub duration_secs: Option<f64>,
     /// `None` means the default interval.
     pub status_interval_secs: Option<f64>,
@@ -85,6 +95,17 @@ fn parse_play<I: Iterator<Item = String>>(mut args: I) -> Result<PlayArgs> {
             }
             "--sink" => {
                 parsed.sinks.push(take_value(&mut args, "--sink")?);
+            }
+            "--delay" => {
+                let raw = take_value(&mut args, "--delay")?;
+                let ms: f64 = raw
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("`--delay` expects a number, got `{raw}`"))?;
+                // Same range check the interactive driver uses, so both reject
+                // the same values with the same wording.
+                parsed
+                    .delays_ms
+                    .push(crate::audio::command::validate_delay_ms(ms)?);
             }
             "--duration" => {
                 parsed.duration_secs = Some(take_positive(&mut args, "--duration")?);
@@ -159,6 +180,7 @@ mod tests {
         let expected = Command::Play(PlayArgs {
             source: Some("0".into()),
             sinks: vec!["{0.0.0.00000000}.{abc}".into()],
+            delays_ms: vec![120.0],
             duration_secs: Some(5.0),
             status_interval_secs: Some(2.5),
             no_correction: false,
@@ -169,6 +191,8 @@ mod tests {
             "0",
             "--sink",
             "{0.0.0.00000000}.{abc}",
+            "--delay",
+            "120",
             "--duration",
             "5",
             "--status-interval",
@@ -176,6 +200,39 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn delay_is_repeatable_and_ordered() {
+        let Command::Play(args) = parse_str(&[
+            "play", "--sink", "6", "--delay", "0", "--sink", "4", "--delay", "120",
+        ])
+        .unwrap() else {
+            panic!("expected a play command");
+        };
+        assert_eq!(args.sinks, vec!["6".to_string(), "4".to_string()]);
+        assert_eq!(args.delays_ms, vec![0.0, 120.0]);
+    }
+
+    #[test]
+    fn delay_defaults_to_none_given() {
+        let Command::Play(args) = parse_str(&["play", "--sink", "4"]).unwrap() else {
+            panic!("expected a play command");
+        };
+        assert!(args.delays_ms.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_delay_outside_the_supported_range() {
+        for bad in ["-1", "251", "1000", "soon"] {
+            assert!(
+                parse_str(&["play", "--sink", "4", "--delay", bad]).is_err(),
+                "`--delay {bad}` should have been refused"
+            );
+        }
+        // The boundaries are fine.
+        assert!(parse_str(&["play", "--sink", "4", "--delay", "0"]).is_ok());
+        assert!(parse_str(&["play", "--sink", "4", "--delay", "250"]).is_ok());
     }
 
     #[test]

@@ -36,6 +36,10 @@
 /// dragging a slider still feels immediate. CLAUDE.md specifies roughly 10 ms.
 pub const CROSSFADE_MS: f64 = 10.0;
 
+/// Deepest delay the UI and CLI will accept, and the size every delay line is
+/// allocated for. CLAUDE.md fixes the range at 0–250 ms.
+pub const MAX_DELAY_MS: f64 = 250.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelayConfigError {
     /// A delay line needs at least one channel.
@@ -53,7 +57,6 @@ pub struct DelayLine {
     buffer: Box<[f32]>,
     capacity_frames: usize,
     channels: usize,
-    sample_rate: u32,
     max_delay_frames: usize,
 
     /// Next frame index to write.
@@ -101,7 +104,6 @@ impl DelayLine {
             buffer: vec![0.0; capacity_frames * channels].into_boxed_slice(),
             capacity_frames,
             channels,
-            sample_rate,
             max_delay_frames,
             write_frame: 0,
             delay_frames: 0,
@@ -113,16 +115,14 @@ impl DelayLine {
         })
     }
 
-    pub fn channels(&self) -> usize {
-        self.channels
-    }
-
+    #[cfg(test)]
     pub fn max_delay_frames(&self) -> usize {
         self.max_delay_frames
     }
 
     /// Crossfade length in frames — the lag between asking for a delay and
     /// fully arriving at it.
+    #[cfg(test)]
     pub fn crossfade_frames(&self) -> usize {
         self.fade_length
     }
@@ -132,11 +132,13 @@ impl DelayLine {
         self.delay_frames
     }
 
+    #[cfg(test)]
     pub fn is_crossfading(&self) -> bool {
         self.fading
     }
 
     /// A change that arrived mid-crossfade and has not started yet.
+    #[cfg(test)]
     pub fn pending_delay_frames(&self) -> Option<usize> {
         self.pending_delay_frames
     }
@@ -183,11 +185,6 @@ impl DelayLine {
         self.fading = true;
     }
 
-    /// Same, in milliseconds, rounded to the nearest frame.
-    pub fn set_delay_ms(&mut self, ms: f64) {
-        self.set_delay_frames(ms_to_frames(ms.max(0.0), self.sample_rate));
-    }
-
     /// Jump straight to a delay with no crossfade.
     ///
     /// For setup and for restarting a stream, where there is no audio in flight
@@ -203,8 +200,10 @@ impl DelayLine {
 
     /// Forget all buffered audio, keeping the delay setting.
     ///
-    /// Used when a stream restarts and the samples in the line belong to a
-    /// device that is no longer there.
+    /// For a stream restart, where the samples in the line belong to a device
+    /// that is no longer there. Test-only until the hotplug path in a later
+    /// milestone has somewhere to call it from.
+    #[cfg(test)]
     pub fn reset(&mut self) {
         self.buffer.fill(0.0);
         self.write_frame = 0;
@@ -292,7 +291,11 @@ impl DelayLine {
 }
 
 /// Milliseconds to frames, rounded to nearest.
-fn ms_to_frames(ms: f64, sample_rate: u32) -> usize {
+///
+/// The single conversion point between the presentation unit and the canonical
+/// one, shared with the CLI and the command parser so every path rounds the
+/// same way.
+pub fn ms_to_frames(ms: f64, sample_rate: u32) -> usize {
     (ms * f64::from(sample_rate) / 1000.0).round().max(0.0) as usize
 }
 
@@ -408,16 +411,22 @@ mod tests {
 
     #[test]
     fn milliseconds_convert_to_frames_and_clamp() {
+        // Conversion lives at the control-thread boundary, not on the line —
+        // the line's canonical unit is frames and it never sees milliseconds.
+        assert_eq!(ms_to_frames(10.0, RATE), 480);
+        assert_eq!(ms_to_frames(0.0, RATE), 0);
+        assert_eq!(ms_to_frames(250.0, RATE), 12_000);
+        // Rounds to nearest rather than truncating.
+        assert_eq!(ms_to_frames(0.5, RATE), 24);
+        assert_eq!(ms_to_frames(0.0104, RATE), 0);
+
         let mut line = line(2, 250.0);
-        line.set_delay_ms(10.0);
+        line.set_delay_frames(ms_to_frames(10.0, RATE));
         assert_eq!(line.delay_frames(), 480);
 
         // Past the maximum clamps rather than wrapping the read pointer.
         line.set_delay_frames_immediate(999_999);
         assert_eq!(line.delay_frames(), 12_000);
-
-        line.set_delay_ms(-5.0);
-        assert_eq!(line.delay_frames(), 0);
     }
 
     // ---- delay accuracy ----

@@ -2,11 +2,8 @@
 //! the state shared between those threads and the reporting thread.
 
 pub mod capture;
+pub mod command;
 pub mod control;
-// Milestone 5's delay line. Nothing calls it yet: integration into the render
-// path is gated on the milestone 4 drift-correction soak passing, so the audio
-// path stays frozen while it is being certified.
-#[allow(dead_code)]
 pub mod delay;
 pub mod drift;
 pub mod frames;
@@ -98,6 +95,7 @@ pub enum FaultStage {
     Stop = 16,
     ResamplerInit = 17,
     Resample = 18,
+    DelayInit = 19,
 }
 
 impl FaultStage {
@@ -121,6 +119,7 @@ impl FaultStage {
             16 => FaultStage::Stop,
             17 => FaultStage::ResamplerInit,
             18 => FaultStage::Resample,
+            19 => FaultStage::DelayInit,
             _ => FaultStage::None,
         }
     }
@@ -146,6 +145,7 @@ impl FaultStage {
             FaultStage::Stop => "IAudioClient::Stop",
             FaultStage::ResamplerInit => "building the resampler",
             FaultStage::Resample => "Resampler::process_into_buffer",
+            FaultStage::DelayInit => "building the delay line",
         }
     }
 }
@@ -250,6 +250,9 @@ pub struct SinkState {
     /// Frames of latency the ASRC stage adds: resampler group delay plus the
     /// worst-case staging backlog. Zero when correction is off.
     asrc_latency_frames: AtomicU64,
+    /// The delay line's current target, in frames. Published by the render
+    /// thread each callback so the status line can show runtime changes.
+    delay_frames: AtomicU64,
 
     ring_frames: u64,
 }
@@ -275,6 +278,7 @@ impl SinkState {
             correction_clamped: AtomicU64::new(0),
             correction_enabled: AtomicBool::new(false),
             asrc_latency_frames: AtomicU64::new(0),
+            delay_frames: AtomicU64::new(0),
             ring_frames,
         }
     }
@@ -329,6 +333,18 @@ impl SinkState {
 
     pub fn asrc_latency_frames(&self) -> u64 {
         self.asrc_latency_frames.load(Ordering::Relaxed)
+    }
+
+    pub fn set_delay_frames(&self, frames: u64) {
+        self.delay_frames.store(frames, Ordering::Relaxed);
+    }
+
+    pub fn delay_frames(&self) -> u64 {
+        self.delay_frames.load(Ordering::Relaxed)
+    }
+
+    pub fn delay_ms(&self, sample_rate: u32) -> f64 {
+        self.delay_frames() as f64 * 1000.0 / f64::from(sample_rate)
     }
 
     pub fn ring_frames(&self) -> u64 {
@@ -511,6 +527,7 @@ mod tests {
             FaultStage::Stop,
             FaultStage::ResamplerInit,
             FaultStage::Resample,
+            FaultStage::DelayInit,
         ];
         for stage in stages {
             assert_eq!(FaultStage::from_code(stage as u32), stage);

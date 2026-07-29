@@ -1,8 +1,12 @@
 //! WASAPI loopback capture thread.
 //!
 //! Opens the *render* endpoint named by `device_id` in loopback mode, which
-//! yields whatever the system mixer is sending to that endpoint, and pushes the
-//! interleaved f32 frames into the ring.
+//! yields whatever the system mixer is sending to that endpoint, and fans the
+//! interleaved f32 frames out to one ring per sink.
+//!
+//! Each sink's ring is filled independently: a sink whose ring is full has its
+//! frames dropped and its own overrun counters bumped, while the other sink
+//! still receives everything. One stalled output must never starve the other.
 //!
 //! Real-time rules (CLAUDE.md) apply from `IAudioClient::Start` onward: no
 //! allocation, no locks, no logging, no panicking paths. Everything the loop
@@ -19,7 +23,7 @@ use windows::Win32::Media::Audio::{
 };
 
 use super::rt::{ActivatedClient, ComApartment, EventHandle, MmcssRegistration, WaitOutcome};
-use super::{CapturePacing, FaultStage, SharedState};
+use super::{CapturePacing, FaultStage, MAX_SINKS, SharedState};
 use crate::devices::{MixFormat, open_device_by_id};
 
 /// Endpoint buffer requested from WASAPI, in 100-ns units (100 ms).
@@ -38,14 +42,15 @@ const EVENT_WAIT_TIMEOUT_MS: u32 = 100;
 /// event-driven pacing and switching to the timer.
 const TIMEOUTS_BEFORE_POLL_FALLBACK: u32 = 5;
 
+/// The fan-out table: one ring producer per sink, in sink order.
+///
+/// A fixed-size array rather than a `Vec` so the real-time loop iterates over
+/// inline storage that cannot be reallocated. Unused slots stay `None`.
+pub type SinkFeeds = [Option<Producer<f32>>; MAX_SINKS];
+
 /// Body of the capture thread. Never panics; faults are recorded and the thread
-/// returns, which the main thread notices.
-pub fn run(
-    device_id: String,
-    expected: MixFormat,
-    shared: Arc<SharedState>,
-    mut producer: Producer<f32>,
-) {
+/// returns, which the reporting thread notices.
+pub fn run(device_id: String, expected: MixFormat, shared: Arc<SharedState>, mut feeds: SinkFeeds) {
     // COM apartment first so it is dropped last, after every interface it owns.
     let _com = match ComApartment::enter() {
         Ok(guard) => guard,
@@ -63,7 +68,7 @@ pub fn run(
         .capture_mmcss
         .store(_mmcss.is_registered(), Ordering::Relaxed);
 
-    if let Err(()) = setup_and_run(&device_id, expected, &shared, &mut producer) {
+    if let Err(()) = setup_and_run(&device_id, expected, &shared, &mut feeds) {
         shared.request_stop();
     }
 }
@@ -73,7 +78,7 @@ fn setup_and_run(
     device_id: &str,
     expected: MixFormat,
     shared: &SharedState,
-    producer: &mut Producer<f32>,
+    feeds: &mut SinkFeeds,
 ) -> Result<(), ()> {
     // SAFETY: this thread's COM apartment is live for the whole function.
     unsafe {
@@ -197,7 +202,7 @@ fn setup_and_run(
 
             // Drain every packet that is ready, regardless of what woke us.
             // This is what makes the two pacing modes interchangeable.
-            if drain_packets(&capture_client, shared, producer, channels).is_err() {
+            if drain_packets(&capture_client, shared, feeds, channels).is_err() {
                 break;
             }
         }
@@ -243,9 +248,9 @@ unsafe fn activate_and_initialize(
     }
 }
 
-/// Pull every ready packet into the ring.
+/// Pull every ready packet and fan it out to every sink ring.
 ///
-/// Allocation-free: `write_chunk_uninit` writes in place into the ring's own
+/// Allocation-free: `write_chunk_uninit` writes in place into each ring's own
 /// storage.
 ///
 /// # Safety
@@ -254,7 +259,7 @@ unsafe fn activate_and_initialize(
 unsafe fn drain_packets(
     capture_client: &IAudioCaptureClient,
     shared: &SharedState,
-    producer: &mut Producer<f32>,
+    feeds: &mut SinkFeeds,
     channels: usize,
 ) -> Result<(), ()> {
     unsafe {
@@ -286,7 +291,24 @@ unsafe fn drain_packets(
 
             if frames > 0 {
                 let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
-                push_frames(shared, producer, data, frames as usize, channels, silent);
+                shared
+                    .frames_captured
+                    .fetch_add(u64::from(frames), Ordering::Relaxed);
+
+                // Fan out. Each sink is served independently so a full ring on
+                // one output cannot cost the other output any frames.
+                for (index, feed) in feeds.iter_mut().enumerate() {
+                    if let Some(producer) = feed {
+                        push_frames(
+                            shared.sink(index),
+                            producer,
+                            data,
+                            frames as usize,
+                            channels,
+                            silent,
+                        );
+                    }
+                }
             }
 
             if let Err(err) = capture_client.ReleaseBuffer(frames) {
@@ -299,17 +321,18 @@ unsafe fn drain_packets(
     }
 }
 
-/// Copy one packet into the ring, dropping the tail if the ring is full.
+/// Copy one packet into one sink's ring, dropping the tail if the ring is full.
 ///
-/// Dropping rather than blocking is deliberate: a capture thread that waits for
-/// space has already failed, and stalling it would back pressure into the
-/// system mixer.
+/// Dropping rather than blocking is deliberate on two counts: a capture thread
+/// that waits for space has already failed and would back-pressure into the
+/// system mixer, and with two sinks a blocking push would let the slower output
+/// dictate the faster one's timing.
 ///
 /// # Safety
 ///
 /// `data` must point to `frames * channels` valid f32 samples, unless `silent`.
 unsafe fn push_frames(
-    shared: &SharedState,
+    sink: &super::SinkState,
     producer: &mut Producer<f32>,
     data: *const u8,
     frames: usize,
@@ -317,19 +340,14 @@ unsafe fn push_frames(
     silent: bool,
 ) {
     unsafe {
-        shared
-            .frames_captured
-            .fetch_add(frames as u64, Ordering::Relaxed);
-
         let free_samples = producer.slots();
         // Only whole frames are ever pushed, so the ring never desynchronizes
         // channel order.
         let writable_frames = (free_samples / channels).min(frames);
 
         if writable_frames < frames {
-            shared.overruns.fetch_add(1, Ordering::Relaxed);
-            shared
-                .overrun_frames
+            sink.overruns.fetch_add(1, Ordering::Relaxed);
+            sink.overrun_frames
                 .fetch_add((frames - writable_frames) as u64, Ordering::Relaxed);
         }
         if writable_frames == 0 {
@@ -340,9 +358,8 @@ unsafe fn push_frames(
         let Ok(mut chunk) = producer.write_chunk_uninit(write_samples) else {
             // slots() is a conservative estimate, so this should not happen;
             // treat it as a full ring rather than trusting the estimate.
-            shared.overruns.fetch_add(1, Ordering::Relaxed);
-            shared
-                .overrun_frames
+            sink.overruns.fetch_add(1, Ordering::Relaxed);
+            sink.overrun_frames
                 .fetch_add(frames as u64, Ordering::Relaxed);
             return;
         };
@@ -369,8 +386,7 @@ unsafe fn push_frames(
         // SAFETY: every slot handed out above was written exactly once.
         chunk.commit_all();
 
-        shared
-            .frames_pushed
+        sink.frames_pushed
             .fetch_add(writable_frames as u64, Ordering::Relaxed);
     }
 }

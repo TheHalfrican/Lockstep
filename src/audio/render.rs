@@ -18,7 +18,7 @@ use windows::Win32::Media::Audio::{
 };
 
 use super::rt::{ActivatedClient, ComApartment, EventHandle, MmcssRegistration, WaitOutcome};
-use super::{FaultStage, SharedState};
+use super::{FaultStage, SharedState, SinkState};
 use crate::devices::{MixFormat, open_device_by_id};
 
 /// Endpoint buffer requested from WASAPI, in 100-ns units (40 ms).
@@ -41,17 +41,23 @@ const EVENT_WAIT_TIMEOUT_MS: u32 = 200;
 /// the cycle.
 const PREBUFFER_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Body of one render thread. `sink_index` selects this thread's slice of the
+/// shared state; every counter it touches belongs to that sink alone, so two
+/// render threads never contend for the same atomic.
 pub fn run(
     device_id: String,
     expected: MixFormat,
     prebuffer_frames: usize,
+    sink_index: usize,
     shared: Arc<SharedState>,
     mut consumer: Consumer<f32>,
 ) {
+    let sink = shared.sink(sink_index);
+
     let _com = match ComApartment::enter() {
         Ok(guard) => guard,
         Err(err) => {
-            shared.render_fault.record(FaultStage::ComInit, err.code());
+            sink.fault.record(FaultStage::ComInit, err.code());
             shared.request_stop();
             return;
         }
@@ -59,15 +65,14 @@ pub fn run(
 
     // Best-effort, same as capture; the summary reports whether it took.
     let _mmcss = MmcssRegistration::pro_audio();
-    shared
-        .render_mmcss
-        .store(_mmcss.is_registered(), Ordering::Relaxed);
+    sink.mmcss.store(_mmcss.is_registered(), Ordering::Relaxed);
 
     if setup_and_run(
         &device_id,
         expected,
         prebuffer_frames,
         &shared,
+        sink,
         &mut consumer,
     )
     .is_err()
@@ -81,6 +86,7 @@ fn setup_and_run(
     expected: MixFormat,
     prebuffer_frames: usize,
     shared: &SharedState,
+    sink: &SinkState,
     consumer: &mut Consumer<f32>,
 ) -> Result<(), ()> {
     // SAFETY: this thread's COM apartment is live for the whole function.
@@ -88,9 +94,7 @@ fn setup_and_run(
         let device = match open_device_by_id(device_id) {
             Ok(device) => device,
             Err(err) => {
-                shared
-                    .render_fault
-                    .record(FaultStage::OpenDevice, hresult_of(&err));
+                sink.fault.record(FaultStage::OpenDevice, hresult_of(&err));
                 return Err(());
             }
         };
@@ -98,15 +102,14 @@ fn setup_and_run(
         let activated = match ActivatedClient::activate(&device) {
             Ok(activated) => activated,
             Err(err) => {
-                shared.render_fault.record(FaultStage::Activate, err.code());
+                sink.fault.record(FaultStage::Activate, err.code());
                 return Err(());
             }
         };
 
         let format = activated.format();
         if format.sample_rate != expected.sample_rate || format.channels != expected.channels {
-            shared
-                .render_fault
+            sink.fault
                 .record(FaultStage::FormatMismatch, windows::core::HRESULT(0));
             return Err(());
         }
@@ -115,9 +118,7 @@ fn setup_and_run(
         let event = match EventHandle::new() {
             Ok(event) => event,
             Err(err) => {
-                shared
-                    .render_fault
-                    .record(FaultStage::CreateEvent, err.code());
+                sink.fault.record(FaultStage::CreateEvent, err.code());
                 return Err(());
             }
         };
@@ -131,25 +132,19 @@ fn setup_and_run(
             activated.format_ptr(),
             None,
         ) {
-            shared
-                .render_fault
-                .record(FaultStage::Initialize, err.code());
+            sink.fault.record(FaultStage::Initialize, err.code());
             return Err(());
         }
 
         if let Err(err) = activated.client.SetEventHandle(event.raw()) {
-            shared
-                .render_fault
-                .record(FaultStage::SetEventHandle, err.code());
+            sink.fault.record(FaultStage::SetEventHandle, err.code());
             return Err(());
         }
 
         let buffer_frames = match activated.client.GetBufferSize() {
             Ok(frames) => frames,
             Err(err) => {
-                shared
-                    .render_fault
-                    .record(FaultStage::GetBufferSize, err.code());
+                sink.fault.record(FaultStage::GetBufferSize, err.code());
                 return Err(());
             }
         };
@@ -157,9 +152,7 @@ fn setup_and_run(
         let render_client: IAudioRenderClient = match activated.client.GetService() {
             Ok(client) => client,
             Err(err) => {
-                shared
-                    .render_fault
-                    .record(FaultStage::GetService, err.code());
+                sink.fault.record(FaultStage::GetService, err.code());
                 return Err(());
             }
         };
@@ -178,15 +171,32 @@ fn setup_and_run(
             return Ok(());
         }
 
-        // Prime the whole endpoint buffer before Start so the first device
-        // period is served from the ring rather than from a race.
-        write_period(&render_client, shared, consumer, buffer_frames, channels)?;
+        // Fill the endpoint buffer before Start so the first device period is
+        // served from something rather than from a race. Silence, because the
+        // ring may legitimately still be empty at this point.
+        write_silence(&render_client, sink, buffer_frames, channels)?;
 
         if let Err(err) = activated.client.Start() {
-            shared.render_fault.record(FaultStage::Start, err.code());
+            sink.fault.record(FaultStage::Start, err.code());
             return Err(());
         }
-        shared.render_running.store(true, Ordering::Release);
+        sink.running.store(true, Ordering::Release);
+
+        // Phase two of the start-up handshake.
+        //
+        // The prebuffer wait above can expire without the ring reaching its
+        // target — and on this hardware it routinely does, because an idle
+        // WASAPI endpoint produces no loopback packets at all until something
+        // renders to it. Starting the client is what breaks that deadlock, but
+        // it leaves the ring empty, and nothing in an uncorrected passthrough
+        // ever pushes occupancy back up: capture and render then run at the
+        // same average rate forever, parked at 0% with a permanent underrun.
+        //
+        // So until the ring reaches its setpoint the endpoint is fed silence
+        // *without* draining the ring, letting it fill. This is buffer priming,
+        // not drift correction — once primed the read pointer is never adjusted
+        // again, so a genuine clock difference still shows up as a trend.
+        let mut primed = false;
 
         // ---- real-time region begins: no allocation past this point ----
 
@@ -197,8 +207,7 @@ fn setup_and_run(
                 // re-check the stop flag.
                 WaitOutcome::TimedOut => continue,
                 WaitOutcome::Failed(code) => {
-                    shared
-                        .render_fault
+                    sink.fault
                         .record(FaultStage::Wait, windows::core::HRESULT(code.0 as i32));
                     break;
                 }
@@ -207,9 +216,7 @@ fn setup_and_run(
             let padding = match activated.client.GetCurrentPadding() {
                 Ok(padding) => padding,
                 Err(err) => {
-                    shared
-                        .render_fault
-                        .record(FaultStage::GetPadding, err.code());
+                    sink.fault.record(FaultStage::GetPadding, err.code());
                     break;
                 }
             };
@@ -219,7 +226,17 @@ fn setup_and_run(
                 continue;
             }
 
-            if write_period(&render_client, shared, consumer, available, channels).is_err() {
+            if !primed && consumer.slots() / channels >= prebuffer_frames {
+                primed = true;
+                sink.primed.store(true, Ordering::Release);
+            }
+
+            let result = if primed {
+                write_period(&render_client, sink, consumer, available, channels)
+            } else {
+                write_silence(&render_client, sink, available, channels)
+            };
+            if result.is_err() {
                 break;
             }
         }
@@ -227,9 +244,9 @@ fn setup_and_run(
         // ---- real-time region ends ----
 
         if let Err(err) = activated.client.Stop() {
-            shared.render_fault.record(FaultStage::Stop, err.code());
+            sink.fault.record(FaultStage::Stop, err.code());
         }
-        shared.render_running.store(false, Ordering::Release);
+        sink.running.store(false, Ordering::Release);
     }
 
     Ok(())
@@ -245,7 +262,7 @@ fn setup_and_run(
 /// Caller must hold an initialized render client on a COM-initialized thread.
 unsafe fn write_period(
     render_client: &IAudioRenderClient,
-    shared: &SharedState,
+    sink: &SinkState,
     consumer: &mut Consumer<f32>,
     frames: u32,
     channels: usize,
@@ -254,9 +271,7 @@ unsafe fn write_period(
         let dst = match render_client.GetBuffer(frames) {
             Ok(ptr) => ptr,
             Err(err) => {
-                shared
-                    .render_fault
-                    .record(FaultStage::GetBuffer, err.code());
+                sink.fault.record(FaultStage::GetBuffer, err.code());
                 return Err(());
             }
         };
@@ -286,17 +301,15 @@ unsafe fn write_period(
                 written_samples += slice.len();
             }
             chunk.commit_all();
-            shared
-                .frames_popped
+            sink.frames_popped
                 .fetch_add(ready_frames as u64, Ordering::Relaxed);
         }
 
         let written_frames = written_samples / channels;
         if written_frames < wanted_frames {
             let short = wanted_frames - written_frames;
-            shared.underruns.fetch_add(1, Ordering::Relaxed);
-            shared
-                .underrun_frames
+            sink.underruns.fetch_add(1, Ordering::Relaxed);
+            sink.underrun_frames
                 .fetch_add(short as u64, Ordering::Relaxed);
             // The endpoint buffer is always filled completely: handing WASAPI a
             // partially written block is what produces an audible click.
@@ -304,15 +317,54 @@ unsafe fn write_period(
         }
 
         if let Err(err) = render_client.ReleaseBuffer(frames, 0) {
-            shared
-                .render_fault
-                .record(FaultStage::ReleaseBuffer, err.code());
+            sink.fault.record(FaultStage::ReleaseBuffer, err.code());
             return Err(());
         }
 
-        shared
-            .frames_rendered
+        sink.frames_rendered
             .fetch_add(wanted_frames as u64, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Fill `frames` of the endpoint buffer with silence, leaving the ring alone.
+///
+/// Used while priming: the endpoint must be fed to stay active — that is what
+/// makes the source produce loopback packets at all — but draining the ring
+/// during priming is exactly what stops it from ever reaching its setpoint.
+///
+/// # Safety
+///
+/// Caller must hold an initialized render client on a COM-initialized thread.
+unsafe fn write_silence(
+    render_client: &IAudioRenderClient,
+    sink: &SinkState,
+    frames: u32,
+    channels: usize,
+) -> Result<(), ()> {
+    unsafe {
+        let dst = match render_client.GetBuffer(frames) {
+            Ok(ptr) => ptr,
+            Err(err) => {
+                sink.fault.record(FaultStage::GetBuffer, err.code());
+                return Err(());
+            }
+        };
+        if dst.is_null() {
+            return Err(());
+        }
+
+        std::ptr::write_bytes(dst.cast::<f32>(), 0, frames as usize * channels);
+
+        if let Err(err) = render_client.ReleaseBuffer(frames, 0) {
+            sink.fault.record(FaultStage::ReleaseBuffer, err.code());
+            return Err(());
+        }
+
+        sink.prime_frames
+            .fetch_add(u64::from(frames), Ordering::Relaxed);
+        sink.frames_rendered
+            .fetch_add(u64::from(frames), Ordering::Relaxed);
         Ok(())
     }
 }

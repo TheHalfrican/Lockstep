@@ -1,12 +1,21 @@
-//! Audio engine: loopback capture, rendering, and the state shared between
-//! them and the GUI/CLI thread.
+//! Audio engine: loopback capture fanned out to independent render sinks, and
+//! the state shared between those threads and the reporting thread.
 
 pub mod capture;
+pub mod drift;
 pub mod passthrough;
 pub mod render;
 pub mod rt;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+
+/// Hard ceiling on simultaneous outputs.
+///
+/// Two is a design decision, not a placeholder: CLAUDE.md lists "more than two
+/// simultaneous outputs" as an explicit non-goal. Fixing it as a constant keeps
+/// the per-sink state in a preallocated array that the capture thread can
+/// iterate without touching the allocator.
+pub const MAX_SINKS: usize = 2;
 
 /// How the capture thread ended up pacing itself.
 ///
@@ -58,7 +67,7 @@ impl CapturePacing {
 /// Where in a thread's life a fault happened.
 ///
 /// Audio threads cannot allocate a `String` to describe a failure, so the stage
-/// is an integer and the main thread turns it back into prose.
+/// is an integer and the reporting thread turns it back into prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum FaultStage {
@@ -158,11 +167,11 @@ impl FaultSlot {
         Some((stage, code))
     }
 
-    /// Human-readable rendering, main thread only (it allocates).
+    /// Human-readable rendering. Reporting thread only — it allocates.
     pub fn describe(&self, who: &str) -> Option<String> {
         let (stage, hr) = self.take()?;
         Some(format!(
-            "{who} thread failed at {}: 0x{:08X} — {}",
+            "{who} failed at {}: 0x{:08X} — {}",
             stage.as_str(),
             hr.0 as u32,
             windows::core::Error::from(hr).message()
@@ -170,59 +179,51 @@ impl FaultSlot {
     }
 }
 
-/// Counters and flags shared between the audio threads and the reporting
-/// thread. Every field is atomic; nothing here ever blocks an audio thread.
+/// Per-sink counters, one instance per render thread.
+///
+/// Cache-line aligned. Without the alignment two sinks' counters would share a
+/// line, and every `fetch_add` on one render thread would invalidate the
+/// other's copy — false sharing between two threads that must not miss a
+/// deadline.
 #[derive(Debug)]
-pub struct SharedState {
-    /// Set by the main thread (or by a faulting audio thread) to wind
-    /// everything down.
-    pub stop: AtomicBool,
-
-    /// Frames handed to us by `IAudioCaptureClient::GetBuffer`, including any
-    /// subsequently dropped for want of ring space.
-    pub frames_captured: AtomicU64,
-    /// Frames actually written into the ring.
+#[repr(align(64))]
+pub struct SinkState {
+    /// Frames written into this sink's ring by the capture thread.
     pub frames_pushed: AtomicU64,
-    /// Frames actually read out of the ring.
+    /// Frames read out of this sink's ring by its render thread.
     pub frames_popped: AtomicU64,
-    /// Frames written to the render endpoint, silence padding included.
+    /// Frames written to the endpoint, silence padding included.
     pub frames_rendered: AtomicU64,
 
     /// Render callbacks that found too little in the ring.
     pub underruns: AtomicU64,
     /// Frames of silence substituted across all underruns.
     pub underrun_frames: AtomicU64,
-    /// Capture packets that did not fit in the ring.
+    /// Capture packets that did not fit in this sink's ring.
     pub overruns: AtomicU64,
     /// Frames discarded across all overruns.
     pub overrun_frames: AtomicU64,
 
-    /// Set once the render client has actually been started.
-    pub render_running: AtomicBool,
-    /// Set once the capture client has actually been started.
-    pub capture_running: AtomicBool,
+    /// Frames of silence rendered while priming the ring up to its setpoint.
+    /// Distinct from underruns: these are deliberate, not a failure.
+    pub prime_frames: AtomicU64,
 
-    /// Whether each thread got its MMCSS "Pro Audio" registration. Registration
-    /// is best-effort, and a silent failure would show up later as mysterious
-    /// dropouts under load, so it is reported rather than assumed.
-    pub capture_mmcss: AtomicBool,
-    pub render_mmcss: AtomicBool,
+    /// Set once this sink's render client is started.
+    pub running: AtomicBool,
+    /// Set once the ring has reached its prebuffer setpoint and the sink is in
+    /// normal passthrough. Drift is only meaningful from this point on.
+    pub primed: AtomicBool,
+    /// Whether this render thread got its MMCSS "Pro Audio" registration.
+    pub mmcss: AtomicBool,
 
-    pacing: AtomicU32,
+    pub fault: FaultSlot,
 
-    pub capture_fault: FaultSlot,
-    pub render_fault: FaultSlot,
-
-    /// Ring capacity in frames — fixed at construction, kept here so the
-    /// reporting thread can compute occupancy as a percentage.
     ring_frames: u64,
 }
 
-impl SharedState {
-    pub fn new(ring_frames: u64) -> Self {
-        SharedState {
-            stop: AtomicBool::new(false),
-            frames_captured: AtomicU64::new(0),
+impl SinkState {
+    fn new(ring_frames: u64) -> Self {
+        SinkState {
             frames_pushed: AtomicU64::new(0),
             frames_popped: AtomicU64::new(0),
             frames_rendered: AtomicU64::new(0),
@@ -230,15 +231,97 @@ impl SharedState {
             underrun_frames: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
             overrun_frames: AtomicU64::new(0),
-            render_running: AtomicBool::new(false),
-            capture_running: AtomicBool::new(false),
-            capture_mmcss: AtomicBool::new(false),
-            render_mmcss: AtomicBool::new(false),
-            pacing: AtomicU32::new(CapturePacing::Undetermined.code()),
-            capture_fault: FaultSlot::default(),
-            render_fault: FaultSlot::default(),
+            prime_frames: AtomicU64::new(0),
+            running: AtomicBool::new(false),
+            primed: AtomicBool::new(false),
+            mmcss: AtomicBool::new(false),
+            fault: FaultSlot::default(),
             ring_frames,
         }
+    }
+
+    pub fn ring_frames(&self) -> u64 {
+        self.ring_frames
+    }
+
+    /// Live ring occupancy in frames.
+    ///
+    /// Derived from the two monotonic counters rather than from `rtrb`'s own
+    /// `slots()`, because neither the producer nor the consumer handle is
+    /// reachable from the reporting thread. `popped` is read *first* so the
+    /// subtraction cannot see a `pushed` value older than the `popped` value
+    /// and go negative.
+    ///
+    /// This is the drift observable: a ring that slowly fills or drains is two
+    /// clocks disagreeing, and it is what milestone 4's PI controller will
+    /// regulate back to the midpoint.
+    pub fn ring_occupancy_frames(&self) -> u64 {
+        let popped = self.frames_popped.load(Ordering::Relaxed);
+        let pushed = self.frames_pushed.load(Ordering::Relaxed);
+        pushed.saturating_sub(popped)
+    }
+
+    pub fn ring_occupancy_percent(&self) -> f64 {
+        if self.ring_frames == 0 {
+            return 0.0;
+        }
+        100.0 * self.ring_occupancy_frames() as f64 / self.ring_frames as f64
+    }
+}
+
+/// State shared between the capture thread, every render thread, and the
+/// reporting thread. Every field is atomic; nothing here ever blocks an audio
+/// thread.
+#[derive(Debug)]
+pub struct SharedState {
+    /// Set by the reporting thread, or by a faulting audio thread, to wind
+    /// everything down.
+    pub stop: AtomicBool,
+
+    /// Frames handed to us by `IAudioCaptureClient::GetBuffer`. Global: there
+    /// is one capture stream no matter how many sinks consume it.
+    pub frames_captured: AtomicU64,
+    pub capture_running: AtomicBool,
+    pub capture_mmcss: AtomicBool,
+    pub capture_fault: FaultSlot,
+    pacing: AtomicU32,
+
+    /// Preallocated for `MAX_SINKS`; only the first `sink_count` are live. A
+    /// fixed array means the capture thread's fan-out loop never touches the
+    /// allocator and never chases a growable pointer.
+    sinks: [SinkState; MAX_SINKS],
+    sink_count: usize,
+}
+
+impl SharedState {
+    pub fn new(sink_count: usize, ring_frames: u64) -> Self {
+        debug_assert!(sink_count <= MAX_SINKS);
+        SharedState {
+            stop: AtomicBool::new(false),
+            frames_captured: AtomicU64::new(0),
+            capture_running: AtomicBool::new(false),
+            capture_mmcss: AtomicBool::new(false),
+            capture_fault: FaultSlot::default(),
+            pacing: AtomicU32::new(CapturePacing::Undetermined.code()),
+            sinks: std::array::from_fn(|_| SinkState::new(ring_frames)),
+            sink_count: sink_count.min(MAX_SINKS),
+        }
+    }
+
+    /// Per-sink state for a live sink. Indexing past `sink_count` reaches a
+    /// preallocated but unused slot, which would silently drop counters — that
+    /// is a wiring bug, so it is asserted rather than tolerated.
+    pub fn sink(&self, index: usize) -> &SinkState {
+        debug_assert!(
+            index < self.sink_count,
+            "sink index {index} is beyond the {} live sinks",
+            self.sink_count
+        );
+        &self.sinks[index]
+    }
+
+    pub fn sink_count(&self) -> usize {
+        self.sink_count
     }
 
     pub fn should_stop(&self) -> bool {
@@ -255,32 +338,5 @@ impl SharedState {
 
     pub fn pacing(&self) -> CapturePacing {
         CapturePacing::from_code(self.pacing.load(Ordering::Relaxed))
-    }
-
-    pub fn ring_frames(&self) -> u64 {
-        self.ring_frames
-    }
-
-    /// Live ring occupancy in frames.
-    ///
-    /// Derived from the two monotonic counters rather than from `rtrb`'s own
-    /// `slots()`, because neither the producer nor the consumer handle is
-    /// reachable from the reporting thread. `popped` is read *first* so the
-    /// subtraction cannot see a `pushed` value older than the `popped` value
-    /// and go negative.
-    ///
-    /// This number is the observable that milestone 4's PI controller will
-    /// regulate, which is why it is a live reading and not a one-shot.
-    pub fn ring_occupancy_frames(&self) -> u64 {
-        let popped = self.frames_popped.load(Ordering::Relaxed);
-        let pushed = self.frames_pushed.load(Ordering::Relaxed);
-        pushed.saturating_sub(popped)
-    }
-
-    pub fn ring_occupancy_percent(&self) -> f64 {
-        if self.ring_frames == 0 {
-            return 0.0;
-        }
-        100.0 * self.ring_occupancy_frames() as f64 / self.ring_frames as f64
     }
 }

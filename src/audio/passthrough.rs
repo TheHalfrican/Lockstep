@@ -1,5 +1,19 @@
-//! Session setup for single-output passthrough: validate, wire the ring, spawn
-//! the two audio threads, report, and shut down cleanly.
+//! Session setup for passthrough: validate, wire one ring per sink, spawn the
+//! capture and render threads, report drift, and shut down cleanly.
+//!
+//! Topology, matching the CLAUDE.md architecture diagram minus the processing
+//! stages that do not exist yet:
+//!
+//! ```text
+//! WASAPI loopback capture (source endpoint)
+//!         ├──> rtrb ring ──> render thread A
+//!         └──> rtrb ring ──> render thread B
+//! ```
+//!
+//! The two sinks are fully independent: separate rings, separate render
+//! threads, separate counters, separate fault slots. Nothing synchronises them,
+//! which is the point of this milestone — the drift between their clocks is
+//! what we are here to measure.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -10,45 +24,80 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use rtrb::RingBuffer;
 
-use super::{SharedState, capture, render};
-use crate::devices::DeviceInfo;
+use super::drift::DriftEstimator;
+use super::{MAX_SINKS, SharedState, SinkState, capture, render};
+use crate::devices::{DeviceInfo, MixFormat};
 
 /// Ring depth. 500 ms is far more than passthrough needs, but milestone 4's
 /// drift controller regulates occupancy around the midpoint and needs room to
 /// swing in both directions before anything breaks.
 const RING_DURATION_MS: u64 = 500;
 
-/// Target fill before the render client starts, as a fraction of ring depth.
+/// Target fill before a render client starts, as a fraction of ring depth.
 /// The same 50% setpoint the PI controller will later regulate to.
 const PREBUFFER_FRACTION: f64 = 0.5;
 
-const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Occupancy samples inside this window after the first reading are discarded
+/// from the drift fit: the ring is still settling from prebuffer and the
+/// transient would bias the slope. Widened when the status interval is coarse,
+/// so the warm-up never eats every sample.
+const DRIFT_WARMUP_BASE: Duration = Duration::from_secs(10);
 
 pub struct PassthroughConfig<'a> {
     pub source: &'a DeviceInfo,
-    pub sink: &'a DeviceInfo,
+    pub sinks: &'a [&'a DeviceInfo],
     pub duration: Option<Duration>,
+    pub status_interval: Option<Duration>,
+}
+
+/// A sink resolved and ready to run.
+struct SinkPlan {
+    label: String,
+    device_id: String,
 }
 
 pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
     let source_format = validate(config.source, "source")?;
-    let sink_format = validate(config.sink, "sink")?;
+    let sink_count = config.sinks.len();
 
-    if source_format.sample_rate != sink_format.sample_rate
-        || source_format.channels != sink_format.channels
-    {
-        bail!(
-            "source and sink mix formats differ and this milestone does no conversion:\n  \
-             source [{}] {}: {}\n  sink   [{}] {}: {}\n\
-             Sample-rate and channel-count conversion arrive with the resampler and downmix \
-             stages.",
-            config.source.index,
-            display_name(config.source),
-            source_format.summary(),
-            config.sink.index,
-            display_name(config.sink),
-            sink_format.summary(),
-        );
+    if sink_count == 0 {
+        bail!("passthrough needs at least one sink");
+    }
+    if sink_count > MAX_SINKS {
+        bail!("at most {MAX_SINKS} sinks are supported, got {sink_count}");
+    }
+
+    let mut plans: Vec<SinkPlan> = Vec::with_capacity(sink_count);
+    for sink in config.sinks {
+        let sink_format = validate(sink, "sink")?;
+        require_matching_formats(config.source, source_format, sink, sink_format)?;
+
+        let device_id = sink
+            .id
+            .clone()
+            .with_context(|| format!("sink endpoint [{}] has no device id", sink.index))?;
+
+        // Two render clients on one endpoint would teach us nothing about
+        // drift — they share a clock by construction — and the second
+        // Initialize may well fail anyway.
+        if let Some(existing) = plans.iter().find(|p| p.device_id == device_id) {
+            bail!(
+                "the same endpoint was given twice as a sink: {} and [{}] {} both resolve to\n  \
+                 {}\nTwo render streams on one endpoint share a clock, so this measures nothing. \
+                 Pick two different devices.",
+                existing.label,
+                sink.index,
+                display_name(sink),
+                device_id
+            );
+        }
+
+        plans.push(SinkPlan {
+            label: format!("[{}] {}", sink.index, display_name(sink)),
+            device_id,
+        });
     }
 
     let source_id = config
@@ -56,114 +105,90 @@ pub fn run(config: PassthroughConfig<'_>) -> Result<()> {
         .id
         .clone()
         .context("source endpoint has no device id")?;
-    let sink_id = config
-        .sink
-        .id
-        .clone()
-        .context("sink endpoint has no device id")?;
 
-    let same_endpoint = source_id == sink_id;
-
-    let channels = sink_format.channels as usize;
-    let sample_rate = sink_format.sample_rate as u64;
-    let ring_frames = (sample_rate * RING_DURATION_MS / 1000) as usize;
+    let channels = source_format.channels as usize;
+    let sample_rate = source_format.sample_rate;
+    let ring_frames = (u64::from(sample_rate) * RING_DURATION_MS / 1000) as usize;
     let ring_samples = ring_frames * channels;
     let prebuffer_frames = (ring_frames as f64 * PREBUFFER_FRACTION) as usize;
+    let status_interval = config.status_interval.unwrap_or(DEFAULT_STATUS_INTERVAL);
 
-    println!("Lockstep — passthrough");
-    println!("======================");
-    println!(
-        "source  [{}] {}",
-        config.source.index,
-        display_name(config.source)
-    );
-    println!("        {}", source_id);
-    println!(
-        "sink    [{}] {}",
-        config.sink.index,
-        display_name(config.sink)
-    );
-    println!("        {}", sink_id);
-    println!("format  {}", sink_format.summary());
-    println!(
-        "ring    {} ms / {} frames ({} samples), prebuffer to {} frames ({:.0}%)",
-        RING_DURATION_MS,
+    print_header(
+        &config,
+        &plans,
+        &source_id,
+        source_format,
         ring_frames,
-        ring_samples,
         prebuffer_frames,
-        PREBUFFER_FRACTION * 100.0
+        status_interval,
     );
-    match config.duration {
-        Some(d) => println!("run     {:.1} s then stop", d.as_secs_f64()),
-        None => println!("run     until Enter is pressed"),
-    }
 
-    if same_endpoint {
-        println!();
-        println!("  !! WARNING: source and sink are the same endpoint.");
-        println!("  !! Loopback capture will re-capture this program's own output, so the");
-        println!("  !! signal path is a feedback loop. With nothing else playing it is a");
-        println!("  !! silence loop and harmless, but any real audio will build on itself.");
-        println!("  !! Turn the volume down before playing anything into it.");
-    }
-    println!();
+    let shared = Arc::new(SharedState::new(sink_count, ring_frames as u64));
 
-    let shared = Arc::new(SharedState::new(ring_frames as u64));
-    let (producer, consumer) = RingBuffer::<f32>::new(ring_samples);
+    // One ring per sink. Producers go to the single capture thread as a fixed
+    // array; each consumer goes to its own render thread.
+    let mut feeds: capture::SinkFeeds = [const { None }; MAX_SINKS];
+    let mut render_threads = Vec::with_capacity(sink_count);
+
+    for (index, plan) in plans.iter().enumerate() {
+        let (producer, consumer) = RingBuffer::<f32>::new(ring_samples);
+        feeds[index] = Some(producer);
+
+        let shared = Arc::clone(&shared);
+        let device_id = plan.device_id.clone();
+        let handle = thread::Builder::new()
+            .name(format!("lockstep-render-{index}"))
+            .spawn(move || {
+                render::run(
+                    device_id,
+                    source_format,
+                    prebuffer_frames,
+                    index,
+                    shared,
+                    consumer,
+                )
+            })
+            .with_context(|| format!("failed to spawn render thread for sink {index}"))?;
+        render_threads.push(handle);
+    }
 
     // Interfaces cannot cross threads (the `windows` crate's COM types are not
     // Send by design), so each thread re-resolves its endpoint from the ID and
     // does its own CoInitializeEx.
     let capture_thread = {
         let shared = Arc::clone(&shared);
-        let format = source_format;
         thread::Builder::new()
             .name("lockstep-capture".into())
-            .spawn(move || capture::run(source_id, format, shared, producer))
+            .spawn(move || capture::run(source_id, source_format, shared, feeds))
             .context("failed to spawn the capture thread")?
-    };
-
-    let render_thread = {
-        let shared = Arc::clone(&shared);
-        let format = sink_format;
-        thread::Builder::new()
-            .name("lockstep-render".into())
-            .spawn(move || render::run(sink_id, format, prebuffer_frames, shared, consumer))
-            .context("failed to spawn the render thread")?
     };
 
     if config.duration.is_none() {
         spawn_enter_watcher(Arc::clone(&shared));
     }
 
-    status_loop(&shared, config.duration);
+    let estimators = status_loop(
+        &shared,
+        &plans,
+        sample_rate,
+        config.duration,
+        status_interval,
+    );
 
     shared.request_stop();
     let _ = capture_thread.join();
-    let _ = render_thread.join();
-
-    print_summary(&shared);
-
-    // Thread faults are reported after the summary so the counters are visible
-    // even when something went wrong.
-    let capture_fault = shared.capture_fault.describe("capture");
-    let render_fault = shared.render_fault.describe("render");
-    if let Some(message) = &capture_fault {
-        eprintln!("ERROR: {message}");
-    }
-    if let Some(message) = &render_fault {
-        eprintln!("ERROR: {message}");
-    }
-    if capture_fault.is_some() || render_fault.is_some() {
-        bail!("passthrough stopped early because an audio thread faulted");
+    for handle in render_threads {
+        let _ = handle.join();
     }
 
-    Ok(())
+    print_summary(&shared, &plans, &estimators);
+
+    report_faults(&shared, &plans)
 }
 
 /// Reject anything the passthrough path cannot handle, with a message that
 /// names the device and says what is wrong.
-fn validate(device: &DeviceInfo, role: &str) -> Result<crate::devices::MixFormat> {
+fn validate(device: &DeviceInfo, role: &str) -> Result<MixFormat> {
     if !device.state.is_active() {
         bail!(
             "{role} endpoint [{}] {} is {}, not Active — passthrough needs an active endpoint",
@@ -194,11 +219,86 @@ fn validate(device: &DeviceInfo, role: &str) -> Result<crate::devices::MixFormat
     Ok(format)
 }
 
+fn require_matching_formats(
+    source: &DeviceInfo,
+    source_format: MixFormat,
+    sink: &DeviceInfo,
+    sink_format: MixFormat,
+) -> Result<()> {
+    if source_format.sample_rate == sink_format.sample_rate
+        && source_format.channels == sink_format.channels
+    {
+        return Ok(());
+    }
+    bail!(
+        "source and sink mix formats differ and this milestone does no conversion:\n  \
+         source [{}] {}: {}\n  sink   [{}] {}: {}\n\
+         Sample-rate and channel-count conversion arrive with the resampler and downmix stages.",
+        source.index,
+        display_name(source),
+        source_format.summary(),
+        sink.index,
+        display_name(sink),
+        sink_format.summary(),
+    );
+}
+
 fn display_name(device: &DeviceInfo) -> &str {
     device
         .friendly_name
         .as_deref()
         .unwrap_or("<name unavailable>")
+}
+
+fn print_header(
+    config: &PassthroughConfig<'_>,
+    plans: &[SinkPlan],
+    source_id: &str,
+    format: MixFormat,
+    ring_frames: usize,
+    prebuffer_frames: usize,
+    status_interval: Duration,
+) {
+    println!("Lockstep — passthrough");
+    println!("======================");
+    println!(
+        "source   [{}] {}",
+        config.source.index,
+        display_name(config.source)
+    );
+    println!("         {source_id}");
+    for (index, plan) in plans.iter().enumerate() {
+        println!("sink {index}   {}", plan.label);
+        println!("         {}", plan.device_id);
+    }
+    println!("format   {}", format.summary());
+    println!(
+        "ring     {} ms / {} frames per sink, prebuffer to {} frames ({:.0}%)",
+        RING_DURATION_MS,
+        ring_frames,
+        prebuffer_frames,
+        PREBUFFER_FRACTION * 100.0
+    );
+    match config.duration {
+        Some(d) => println!("run      {:.1} s then stop", d.as_secs_f64()),
+        None => println!("run      until Enter is pressed"),
+    }
+    println!("status   every {:.1} s", status_interval.as_secs_f64());
+
+    // A sink that is also the source shares the source's clock. Its occupancy
+    // must stay flat, which makes it a useful control against the other sink.
+    for (index, plan) in plans.iter().enumerate() {
+        if plan.device_id == source_id {
+            println!();
+            println!("  !! WARNING: sink {index} is the same endpoint as the source.");
+            println!("  !! Loopback capture will re-capture this program's own output, so the");
+            println!("  !! signal path is a feedback loop. With nothing else playing it is a");
+            println!("  !! silence loop and harmless, but any real audio will build on itself.");
+            println!("  !! It does serve as a same-clock control: this sink's ring occupancy");
+            println!("  !! should stay flat while a sink on other hardware drifts.");
+        }
+    }
+    println!();
 }
 
 /// Watch stdin for Enter and ask the session to stop.
@@ -215,17 +315,29 @@ fn spawn_enter_watcher(shared: Arc<SharedState>) {
         });
 }
 
-/// Print one status line per second until the duration expires, Enter is
-/// pressed, or a thread faults.
+/// Print a status block per interval and accumulate the drift fits.
 ///
-/// This is the seed of milestone 3's drift observation: occupancy is read live
-/// each second, so a ring that is slowly filling or draining shows up as a
-/// trend in this column rather than as a sudden failure.
-fn status_loop(shared: &SharedState, duration: Option<Duration>) {
+/// Occupancy is sampled here, on the reporting thread, from atomics the audio
+/// threads publish — no audio thread does any of this arithmetic.
+fn status_loop(
+    shared: &SharedState,
+    plans: &[SinkPlan],
+    sample_rate: u32,
+    duration: Option<Duration>,
+    status_interval: Duration,
+) -> Vec<DriftEstimator> {
+    // Warm-up must still leave samples behind, so a coarse --status-interval
+    // widens it rather than discarding a fixed 10 s worth of nothing.
+    let warmup = DRIFT_WARMUP_BASE.max(status_interval * 2);
+    let mut estimators: Vec<DriftEstimator> = plans
+        .iter()
+        .map(|_| DriftEstimator::new(sample_rate, warmup))
+        .collect();
+
     let start = Instant::now();
-    let mut next_status = start + STATUS_INTERVAL;
+    let mut next_status = start + status_interval;
     let mut last_captured = 0u64;
-    let mut last_rendered = 0u64;
+    let mut last_rendered = vec![0u64; plans.len()];
 
     loop {
         if shared.should_stop() {
@@ -243,77 +355,193 @@ fn status_loop(shared: &SharedState, duration: Option<Duration>) {
             thread::sleep(Duration::from_millis(20));
             continue;
         }
-        next_status += STATUS_INTERVAL;
+        next_status += status_interval;
 
+        let elapsed = start.elapsed().as_secs_f64();
         let captured = shared.frames_captured.load(Ordering::Relaxed);
-        let rendered = shared.frames_rendered.load(Ordering::Relaxed);
-        let occupancy = shared.ring_occupancy_frames();
 
         println!(
-            "t={:5.1}s  in={:>9} (+{:>6})  out={:>9} (+{:>6})  ring={:5.1}% ({:>6}/{} fr)  \
-             under={} ({} fr)  over={} ({} fr)  pace={}",
-            start.elapsed().as_secs_f64(),
+            "t={:7.1}s  captured={:>11} (+{:>7})  pace={}",
+            elapsed,
             captured,
             captured.saturating_sub(last_captured),
-            rendered,
-            rendered.saturating_sub(last_rendered),
-            shared.ring_occupancy_percent(),
-            occupancy,
-            shared.ring_frames(),
-            shared.underruns.load(Ordering::Relaxed),
-            shared.underrun_frames.load(Ordering::Relaxed),
-            shared.overruns.load(Ordering::Relaxed),
-            shared.overrun_frames.load(Ordering::Relaxed),
             shared.pacing().as_str(),
         );
-        let _ = std::io::stdout().flush();
-
         last_captured = captured;
-        last_rendered = rendered;
+
+        for (index, plan) in plans.iter().enumerate() {
+            let sink = shared.sink(index);
+            let rendered = sink.frames_rendered.load(Ordering::Relaxed);
+            let occupancy = sink.ring_occupancy_frames();
+
+            // Only fit once the ring has reached its setpoint. Occupancy is
+            // still climbing during priming, and folding that ramp into the
+            // fit would read as an enormous fake drift.
+            let primed = sink.primed.load(Ordering::Acquire);
+            if primed {
+                estimators[index].observe(elapsed, occupancy);
+            }
+
+            println!(
+                "    sink {index} {:<26}  out={:>11} (+{:>7})  ring={:5.1}% ({:>6}/{} fr)  \
+                 under={} ({} fr)  over={} ({} fr)  drift≈ {}",
+                truncate(&plan.label, 26),
+                rendered,
+                rendered.saturating_sub(last_rendered[index]),
+                sink.ring_occupancy_percent(),
+                occupancy,
+                sink.ring_frames(),
+                sink.underruns.load(Ordering::Relaxed),
+                sink.underrun_frames.load(Ordering::Relaxed),
+                sink.overruns.load(Ordering::Relaxed),
+                sink.overrun_frames.load(Ordering::Relaxed),
+                if primed {
+                    estimators[index].short_label()
+                } else {
+                    "priming".to_string()
+                },
+            );
+            last_rendered[index] = rendered;
+        }
+        let _ = std::io::stdout().flush();
     }
+
+    estimators
 }
 
-fn print_summary(shared: &SharedState) {
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn print_summary(shared: &SharedState, plans: &[SinkPlan], estimators: &[DriftEstimator]) {
     println!();
     println!("summary");
     println!("-------");
+    println!("  sinks              {}", shared.sink_count());
     println!(
         "  frames captured    {}",
         shared.frames_captured.load(Ordering::Relaxed)
     );
-    println!(
-        "  frames into ring   {}",
-        shared.frames_pushed.load(Ordering::Relaxed)
-    );
-    println!(
-        "  frames out of ring {}",
-        shared.frames_popped.load(Ordering::Relaxed)
-    );
-    println!(
-        "  frames rendered    {} (includes silence padding)",
-        shared.frames_rendered.load(Ordering::Relaxed)
-    );
-    println!(
-        "  underruns          {} ({} frames of silence substituted)",
-        shared.underruns.load(Ordering::Relaxed),
-        shared.underrun_frames.load(Ordering::Relaxed)
-    );
-    println!(
-        "  overruns           {} ({} frames dropped)",
-        shared.overruns.load(Ordering::Relaxed),
-        shared.overrun_frames.load(Ordering::Relaxed)
-    );
-    println!(
-        "  ring at exit       {} frames ({:.1}%)",
-        shared.ring_occupancy_frames(),
-        shared.ring_occupancy_percent()
-    );
     println!("  capture pacing     {}", shared.pacing().as_str());
     println!(
-        "  MMCSS Pro Audio    capture {}, render {}",
-        yes_no(shared.capture_mmcss.load(Ordering::Relaxed)),
-        yes_no(shared.render_mmcss.load(Ordering::Relaxed))
+        "  capture MMCSS      {}",
+        yes_no(shared.capture_mmcss.load(Ordering::Relaxed))
     );
+
+    for (index, plan) in plans.iter().enumerate() {
+        let sink = shared.sink(index);
+        println!();
+        println!("  sink {index}  {}", plan.label);
+        println!("    {}", plan.device_id);
+        println!(
+            "    frames into ring   {}",
+            sink.frames_pushed.load(Ordering::Relaxed)
+        );
+        println!(
+            "    frames out of ring {}",
+            sink.frames_popped.load(Ordering::Relaxed)
+        );
+        println!(
+            "    frames rendered    {} (includes silence padding)",
+            sink.frames_rendered.load(Ordering::Relaxed)
+        );
+        println!(
+            "    priming silence    {} frames (deliberate, before the ring reached setpoint)",
+            sink.prime_frames.load(Ordering::Relaxed)
+        );
+        println!(
+            "    underruns          {} ({} frames of silence substituted)",
+            sink.underruns.load(Ordering::Relaxed),
+            sink.underrun_frames.load(Ordering::Relaxed)
+        );
+        println!(
+            "    overruns           {} ({} frames dropped)",
+            sink.overruns.load(Ordering::Relaxed),
+            sink.overrun_frames.load(Ordering::Relaxed)
+        );
+        println!(
+            "    ring at exit       {} frames ({:.1}%)",
+            sink.ring_occupancy_frames(),
+            sink.ring_occupancy_percent()
+        );
+        println!(
+            "    MMCSS Pro Audio    {}",
+            yes_no(sink.mmcss.load(Ordering::Relaxed))
+        );
+
+        print_drift(&estimators[index], sink);
+    }
+}
+
+fn print_drift(estimator: &DriftEstimator, sink: &SinkState) {
+    match estimator.fit() {
+        None => {
+            println!("    drift              not enough samples to fit");
+        }
+        Some(fit) => {
+            println!(
+                "    drift              {:+.2} ppm ± {:.2} ({:+.3} frames/s, {} samples over \
+                 {:.0} s)",
+                fit.ppm, fit.stderr_ppm, fit.slope_frames_per_sec, fit.samples, fit.span_secs
+            );
+
+            if !fit.is_significant() {
+                // A null result still constrains the answer, and the size of
+                // that constraint is the useful output.
+                println!(
+                    "                       NOT significant — no drift detected, |drift| < \
+                     {:.2} ppm",
+                    fit.upper_bound_ppm()
+                );
+                return;
+            }
+
+            match fit.seconds_to_exhaustion(sink.ring_occupancy_frames(), sink.ring_frames()) {
+                Some(secs) => println!(
+                    "    projected          {} in ~{} at this rate, from the current fill",
+                    fit.exhaustion_kind(),
+                    format_duration(secs)
+                ),
+                None => println!("    projected          no buffer exhaustion at this rate"),
+            }
+        }
+    }
+}
+
+fn format_duration(secs: f64) -> String {
+    if secs < 90.0 {
+        format!("{secs:.0} s")
+    } else if secs < 5_400.0 {
+        format!("{:.1} min", secs / 60.0)
+    } else {
+        format!("{:.1} h", secs / 3_600.0)
+    }
+}
+
+fn report_faults(shared: &SharedState, plans: &[SinkPlan]) -> Result<()> {
+    let mut faulted = false;
+
+    if let Some(message) = shared.capture_fault.describe("capture thread") {
+        eprintln!("ERROR: {message}");
+        faulted = true;
+    }
+    for (index, plan) in plans.iter().enumerate() {
+        let who = format!("render thread for sink {index} {}", plan.label);
+        if let Some(message) = shared.sink(index).fault.describe(&who) {
+            eprintln!("ERROR: {message}");
+            faulted = true;
+        }
+    }
+
+    if faulted {
+        bail!("passthrough stopped early because an audio thread faulted");
+    }
+    Ok(())
 }
 
 fn yes_no(value: bool) -> &'static str {

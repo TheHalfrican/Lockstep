@@ -80,8 +80,13 @@ fn play(args: PlayArgs) -> Result<()> {
     let devices = devices::enumerate_render_endpoints()
         .context("failed to enumerate WASAPI render endpoints")?;
 
-    let sink = devices::resolve_spec(&devices, &args.sink)
-        .with_context(|| format!("could not resolve --sink `{}`", args.sink))?;
+    let mut sinks = Vec::with_capacity(args.sinks.len());
+    for spec in &args.sinks {
+        sinks.push(
+            devices::resolve_spec(&devices, spec)
+                .with_context(|| format!("could not resolve --sink `{spec}`"))?,
+        );
+    }
 
     // Without --source, capture whatever Windows is currently sending sound to.
     // Console rather than Multimedia: it is the role that follows the user's
@@ -97,8 +102,9 @@ fn play(args: PlayArgs) -> Result<()> {
 
     audio::passthrough::run(audio::passthrough::PassthroughConfig {
         source,
-        sink,
+        sinks: &sinks,
         duration: args.duration_secs.map(Duration::from_secs_f64),
+        status_interval: args.status_interval_secs.map(Duration::from_secs_f64),
     })
 }
 

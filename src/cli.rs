@@ -11,22 +11,25 @@ Lockstep — Windows dual-output audio router
 
 USAGE:
     lockstep [list]
-    lockstep play --sink <index|id> [--source <index|id>] [--duration <secs>]
+    lockstep play --sink <index|id> [--sink <index|id>] [--source <index|id>]
+                  [--duration <secs>] [--status-interval <secs>]
     lockstep help
 
 COMMANDS:
     list      Report every render endpoint with its ID and mix format (default)
-    play      Loopback-capture the source endpoint and render it to the sink
+    play      Loopback-capture the source endpoint and render it to the sinks
 
 OPTIONS:
-    --sink <index|id>      Output endpoint. Required.
-    --source <index|id>    Endpoint to capture. Defaults to the current default
-                           Console render endpoint.
-    --duration <secs>      Stop after this long. Without it, runs until Enter.
+    --sink <index|id>          Output endpoint. Required. Repeat once for a
+                               second simultaneous output (two is the maximum).
+    --source <index|id>        Endpoint to capture. Defaults to the current
+                               default Console render endpoint.
+    --duration <secs>          Stop after this long. Without it, runs until Enter.
+    --status-interval <secs>   Seconds between status lines. Default 1.
 
 Indices are the bracketed numbers from `lockstep list`; IDs are the verbatim
 device ID strings from the same report. IDs are stable across reboots and
-renames, indices are not.";
+renames, indices are not — prefer IDs for anything scripted.";
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -39,8 +42,11 @@ pub enum Command {
 pub struct PlayArgs {
     /// `None` means "the default Console render endpoint".
     pub source: Option<String>,
-    pub sink: String,
+    /// One or two output endpoints, in the order given.
+    pub sinks: Vec<String>,
     pub duration_secs: Option<f64>,
+    /// `None` means the default interval.
+    pub status_interval_secs: Option<f64>,
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
@@ -65,7 +71,6 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command> {
 
 fn parse_play<I: Iterator<Item = String>>(mut args: I) -> Result<PlayArgs> {
     let mut parsed = PlayArgs::default();
-    let mut sink: Option<String> = None;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -73,28 +78,43 @@ fn parse_play<I: Iterator<Item = String>>(mut args: I) -> Result<PlayArgs> {
                 parsed.source = Some(take_value(&mut args, "--source")?);
             }
             "--sink" => {
-                sink = Some(take_value(&mut args, "--sink")?);
+                parsed.sinks.push(take_value(&mut args, "--sink")?);
             }
             "--duration" => {
-                let raw = take_value(&mut args, "--duration")?;
-                let secs: f64 = raw
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("`--duration` expects a number, got `{raw}`"))?;
-                if !(secs.is_finite() && secs > 0.0) {
-                    bail!("`--duration` must be a positive number of seconds, got `{raw}`");
-                }
-                parsed.duration_secs = Some(secs);
+                parsed.duration_secs = Some(take_positive(&mut args, "--duration")?);
+            }
+            "--status-interval" => {
+                parsed.status_interval_secs = Some(take_positive(&mut args, "--status-interval")?);
             }
             other => bail!("unknown option `{other}` for `play`\n\n{USAGE}"),
         }
     }
 
-    parsed.sink = match sink {
-        Some(sink) => sink,
-        None => bail!("`play` requires --sink <index|id>\n\n{USAGE}"),
-    };
+    if parsed.sinks.is_empty() {
+        bail!("`play` requires at least one --sink <index|id>\n\n{USAGE}");
+    }
+    // Two simultaneous outputs is the whole point of the project and also its
+    // ceiling; CLAUDE.md lists more than two as an explicit non-goal.
+    if parsed.sinks.len() > crate::audio::MAX_SINKS {
+        bail!(
+            "at most {} --sink options are supported, got {}",
+            crate::audio::MAX_SINKS,
+            parsed.sinks.len()
+        );
+    }
 
     Ok(parsed)
+}
+
+fn take_positive<I: Iterator<Item = String>>(args: &mut I, flag: &str) -> Result<f64> {
+    let raw = take_value(args, flag)?;
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("`{flag}` expects a number, got `{raw}`"))?;
+    if !(value.is_finite() && value > 0.0) {
+        bail!("`{flag}` must be a positive number of seconds, got `{raw}`");
+    }
+    Ok(value)
 }
 
 fn take_value<I: Iterator<Item = String>>(args: &mut I, flag: &str) -> Result<String> {
@@ -129,8 +149,9 @@ mod tests {
     fn play_parses_all_options() {
         let expected = Command::Play(PlayArgs {
             source: Some("0".into()),
-            sink: "{0.0.0.00000000}.{abc}".into(),
+            sinks: vec!["{0.0.0.00000000}.{abc}".into()],
             duration_secs: Some(5.0),
+            status_interval_secs: Some(2.5),
         });
         let parsed = parse_str(&[
             "play",
@@ -140,6 +161,8 @@ mod tests {
             "{0.0.0.00000000}.{abc}",
             "--duration",
             "5",
+            "--status-interval",
+            "2.5",
         ])
         .unwrap();
         assert_eq!(parsed, expected);
@@ -151,6 +174,22 @@ mod tests {
             panic!("expected a play command");
         };
         assert_eq!(args.source, None);
+        assert_eq!(args.status_interval_secs, None);
+    }
+
+    #[test]
+    fn sink_is_repeatable_and_ordered() {
+        let Command::Play(args) =
+            parse_str(&["play", "--sink", "6", "--sink", "4", "--duration", "5"]).unwrap()
+        else {
+            panic!("expected a play command");
+        };
+        assert_eq!(args.sinks, vec!["6".to_string(), "4".to_string()]);
+    }
+
+    #[test]
+    fn rejects_more_than_two_sinks() {
+        assert!(parse_str(&["play", "--sink", "1", "--sink", "2", "--sink", "3"]).is_err());
     }
 
     #[test]
@@ -158,6 +197,12 @@ mod tests {
         assert!(parse_str(&["play", "--sink", "4", "--duration", "0"]).is_err());
         assert!(parse_str(&["play", "--sink", "4", "--duration", "-2"]).is_err());
         assert!(parse_str(&["play", "--sink", "4", "--duration", "soon"]).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_status_interval() {
+        assert!(parse_str(&["play", "--sink", "4", "--status-interval", "0"]).is_err());
+        assert!(parse_str(&["play", "--sink", "4", "--status-interval", "nope"]).is_err());
     }
 
     #[test]

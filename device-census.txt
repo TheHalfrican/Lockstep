@@ -1,0 +1,145 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running `target\debug\lockstep.exe list`
+Lockstep — WASAPI render endpoints
+==================================
+18 endpoint(s) across all device states
+
+[0] Speakers (Realtek USB2.0 Audio)
+     ID:           {0.0.0.00000000}.{07fbfc76-9519-4b62-b84e-a7446e363146}
+     State:        Unplugged
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[1] Digital Output (Realtek USB2.0 Audio)
+     ID:           {0.0.0.00000000}.{0952395c-c882-47fe-bdd2-59b92c624243}
+     State:        Active
+     Default for:  —
+     Mix format:   48000 Hz, 2 ch, 32-bit
+     Format tag:   0xFFFE (WAVE_FORMAT_EXTENSIBLE)
+     Framing:      8 bytes/frame, 384000 bytes/sec, cbSize 22
+     Valid bits:   32
+     Channel mask: 0x00000003 — FL FR
+     SubFormat:    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (00000003-0000-0010-8000-00AA00389B71)
+
+[2] NVIDIA Output (NVIDIA High Definition Audio)
+     ID:           {0.0.0.00000000}.{1fd0f668-b82c-4bcb-a6a7-ca80fc1f34d0}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[3] Digital Output (High Definition Audio Device)
+     ID:           {0.0.0.00000000}.{20dc5e13-466a-4363-9fee-47d9ee3b311d}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[4] SAMSUNG (NVIDIA High Definition Audio)
+     ID:           {0.0.0.00000000}.{2607a49e-443d-4d19-9f1c-6ef9796ff464}
+     State:        Active
+     Default for:  —
+     Mix format:   48000 Hz, 2 ch, 32-bit
+     Format tag:   0xFFFE (WAVE_FORMAT_EXTENSIBLE)
+     Framing:      8 bytes/frame, 384000 bytes/sec, cbSize 22
+     Valid bits:   32
+     Channel mask: 0x00000003 — FL FR
+     SubFormat:    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (00000003-0000-0010-8000-00AA00389B71)
+
+[5] NVIDIA Output (NVIDIA High Definition Audio)
+     ID:           {0.0.0.00000000}.{3786d400-9f10-4e28-aaaa-a2329b379811}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[6] Digital Output (High Definition Audio Device)
+     ID:           {0.0.0.00000000}.{39b4b798-964e-490f-92dc-5b6e4d02de4d}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[7] Headphones (Astro A50 Game)
+     ID:           {0.0.0.00000000}.{3e436a0a-6952-4c96-b251-4604945fbb5a}
+     State:        Active
+     Default for:  —
+     Mix format:   48000 Hz, 6 ch, 32-bit
+     Format tag:   0xFFFE (WAVE_FORMAT_EXTENSIBLE)
+     Framing:      24 bytes/frame, 1152000 bytes/sec, cbSize 22
+     Valid bits:   32
+     Channel mask: 0x0000060F — FL FR FC LFE SL SR
+     SubFormat:    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (00000003-0000-0010-8000-00AA00389B71)
+
+[8] Headset Earphone (A50 X Voice)
+     ID:           {0.0.0.00000000}.{48c48b26-2aad-4045-b349-6b8e600f120b}
+     State:        Active
+     Default for:  —
+     Mix format:   48000 Hz, 2 ch, 32-bit
+     Format tag:   0xFFFE (WAVE_FORMAT_EXTENSIBLE)
+     Framing:      8 bytes/frame, 384000 bytes/sec, cbSize 22
+     Valid bits:   32
+     Channel mask: 0x00000003 — FL FR
+     SubFormat:    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (00000003-0000-0010-8000-00AA00389B71)
+
+[9] Digital Output (High Definition Audio Device)
+     ID:           {0.0.0.00000000}.{5e3489a9-b537-40eb-a1a1-b350ca7feb03}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[10] SAMSUNG (NVIDIA High Definition Audio)
+     ID:           {0.0.0.00000000}.{6da2d7bb-c4e4-4dc0-a93b-140533f49028}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[11] Digital Output (High Definition Audio Device)
+     ID:           {0.0.0.00000000}.{8e5a6650-447c-4582-8590-395bfa5e5fec}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[12] NVIDIA Output (NVIDIA High Definition Audio)
+     ID:           {0.0.0.00000000}.{8f988b43-d639-48af-b673-080972b30469}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[13] Headphones (A50 X Game)
+     ID:           {0.0.0.00000000}.{a20e675d-c83d-4856-b121-b6320f7c22dd}
+     State:        Active
+     Default for:  —
+     Mix format:   48000 Hz, 2 ch, 32-bit
+     Format tag:   0xFFFE (WAVE_FORMAT_EXTENSIBLE)
+     Framing:      8 bytes/frame, 384000 bytes/sec, cbSize 22
+     Valid bits:   32
+     Channel mask: 0x00000003 — FL FR
+     SubFormat:    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (00000003-0000-0010-8000-00AA00389B71)
+
+[14] Digital Output (High Definition Audio Device)
+     ID:           {0.0.0.00000000}.{bfbebd5c-46bf-4e12-bf56-e10f4e724dd4}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[15] NVIDIA Output (NVIDIA High Definition Audio)
+     ID:           {0.0.0.00000000}.{c3dda281-a964-47e3-8ea0-82a79d3e6b8d}
+     State:        NotPresent
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+[16] Headset Earphone (Astro A50 Voice)
+     ID:           {0.0.0.00000000}.{d50b395d-b7e9-4f80-a248-34a3032a6461}
+     State:        Active
+     Default for:  Console, Multimedia
+     Mix format:   48000 Hz, 2 ch, 32-bit
+     Format tag:   0xFFFE (WAVE_FORMAT_EXTENSIBLE)
+     Framing:      8 bytes/frame, 384000 bytes/sec, cbSize 22
+     Valid bits:   32
+     Channel mask: 0x00000003 — FL FR
+     SubFormat:    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (00000003-0000-0010-8000-00AA00389B71)
+
+[17] Headphones (Realtek USB2.0 Audio)
+     ID:           {0.0.0.00000000}.{e5901a05-023d-4aa2-80df-25be1d08440f}
+     State:        Unplugged
+     Default for:  —
+     Mix format:   not queried (endpoint is not active)
+
+6 of 18 endpoint(s) active

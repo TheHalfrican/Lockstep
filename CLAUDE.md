@@ -14,7 +14,7 @@ Two configurations drive every design decision:
 
 | Preset | Output A | Output B |
 |---|---|---|
-| Home theater | Astro A50X (USB, stereo) | Sony receiver (HDMI eARC, multichannel LPCM) |
+| Home theater | Astro A50X (USB, stereo) | Yamaha RX-V385 (HDMI audio return, multichannel LPCM) |
 | Two headsets | Astro A50X (USB, stereo) | Astro A50 Gen 4 (USB, stereo) |
 
 **Non-goals.** Do not propose or build: per-application routing, virtual audio devices or kernel drivers, EQ, VST hosting, microphone or input routing, more than two simultaneous outputs, macOS or Linux support, plugin architectures. If a feature request would make the UI look more like a mixing console, it belongs in a different project.
@@ -29,13 +29,13 @@ These are physical constraints, not assumptions to be optimized away.
 
 **Clock drift is guaranteed.** Both configurations involve two independent hardware clocks. Two Astro base stations are two USB audio devices with two crystals; the A50X and the GPU's HDMI output are likewise unrelated. Nominal 48 kHz on both sides means one device actually runs at ~48000.3 Hz and the other at ~47999.8 Hz. Without correction the ring buffer between capture and render monotonically fills or drains until it underruns. This is the central engineering problem of the project.
 
-**Latency is badly asymmetric in the Home theater preset.** The Sony path traverses GPU → TV → eARC → receiver DSP with upmixing engaged. Realistically 60–150 ms. The A50X wireless link is roughly 20–40 ms. Delay lines can only add, so alignment means holding the headset back to meet the receiver — which adds input-feel latency that matters for competitive play and doesn't matter for media. **Expose this trade-off rather than hiding it.** The user should be able to run aligned or unaligned deliberately.
+**Latency is badly asymmetric in the Home theater preset.** The receiver path traverses GPU → TV → HDMI audio return → Yamaha RX-V385 DSP with upmixing engaged. Realistically 60–150 ms. The A50X wireless link is roughly 20–40 ms. Delay lines can only add, so alignment means holding the headset back to meet the receiver — which adds input-feel latency that matters for competitive play and doesn't matter for media. **Expose this trade-off rather than hiding it.** The user should be able to run aligned or unaligned deliberately.
 
 The Two headsets preset is far better behaved: two wireless headsets with similar latency profiles need only small trim.
 
-**Channel counts differ.** eARC is confirmed present, so the HDMI endpoint may negotiate multichannel LPCM (5.1 or 7.1) while the A50X is a stereo endpoint doing its surround virtualization internally. A downmix matrix is required.
+**Channel counts differ.** The HDMI endpoint negotiates 5.1 LPCM (mask `0x3F`, back-pair) while the A50X is a stereo endpoint; the A50 Gen 4's Game endpoint is also 5.1 but side-pair (`0x60F`). A downmix matrix is required, and channel adaptation runs in both directions.
 
-> **Open question to resolve before writing the downmix code.** The user is verifying whether Windows is sending multichannel LPCM or whether an app is bitstreaming encoded Dolby to the receiver. Loopback capture of an encoded bitstream produces garbage, not audio. If the HDMI endpoint turns out to be stereo-only in practice, the downmix matrix can be cut entirely and the design simplifies. **Ask before implementing this section.**
+> **Resolved 2026-07-31 — measured on the target system, see HARDWARE.md.** Windows sends multichannel LPCM: with the endpoint configured 5.1, discrete six-channel audio was verified end-to-end (Windows speaker test → receiver on Straight, all channels on correct speakers, panel showing 6-ch input). Loopback capture taps upstream of the TV, so capture is clean LPCM regardless of the TV→receiver hop mode. Milestone 6 scope confirmed: BS.775 6→2 downmix (home theater), 2→6 mapping (two headsets), keyed on channel masks (`0x3F` vs `0x60F`), not counts. Residual caveat: apps individually configured to bitstream bypass the LPCM mix and capture as garbage — a per-app setting to check if one app ever sounds broken, not a design constraint.
 
 ---
 

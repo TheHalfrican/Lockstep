@@ -429,6 +429,44 @@ pattern removes any need for a virtual audio device in the media case.
   passthrough at unity cannot clip. Recalibrate zones (green = not
   clipping) or mark unity as nominal.
 
+## Code landed in response to tonight's findings
+
+Same evening, on measured evidence (commits `e0c96b0`, `07ddeb9`,
+`778dbcf`): meter zones recalibrated (green = cannot clip, < -1 dBFS);
+source-idle liveness gate (pause → SOURCE IDLE, frozen correction,
+separate idle tally, re-prime + controller reset on resume); milestone 6
+channel adaptation (mask-aware plans, BS.775 6→2, 2→N zero-fill; format
+check now rate-only). 302 tests passing.
+
+### Hardware verification queue for the new code (next session)
+
+- [ ] **Pause/resume on an adapting sink** (SAMSUNG restored to 5.1 →
+      A50X): pause music > 5 s, resume — sink must re-prime to full
+      setpoint and correction must return near its pre-pause figure. This
+      exercises the merge seam (gate reads ring occupancy in source
+      frames).
+- [ ] **Pause/resume on any sink** — confirm SOURCE IDLE appears, underrun
+      counter does NOT climb, recovery is sub-second, no Stop/Start needed.
+- [ ] **BS.775 level check**: the fold can exceed unity ~7 dB on
+      correlated content (deliberately not normalized). Watch the output
+      meter on loud material; the gain fader is the intended remedy —
+      confirm it suffices.
+- [ ] **2→6 upmap on the Gen 4 Game endpoint** (now unblocked): confirm
+      the Gen 4 behaves sensibly receiving FL/FR + four silent channels vs
+      plain stereo.
+- [ ] **Meter sanity**: loud music at unity should now read green with
+      occasional amber peaks — the "turn it down to stay green" reflex
+      should no longer trigger.
+- [ ] **Stale delay tail across a pause** (pre-existing, more visible
+      now): a sink running ~150 ms delay will replay its buffered tail on
+      resume. Listen for it on the receiver path; if objectionable, the
+      fix is flushing the delay line on re-prime — follow-up item.
+
+Deferred optimization note: a 2→6 upmap runs delay+ASRC at 6 ch (4 silent),
+~3× resampler cost vs stereo (was ~10% of deadline at 2 ch — fine today).
+If it ever crowds the deadline, split adaptation: downmix before delay,
+upmap after ASRC.
+
 ## §5b / §6 — pending user presence
 
 Audible passthrough, GUI shakedown, corrected soaks, music-load runs, and

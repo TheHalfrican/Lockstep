@@ -151,6 +151,8 @@ A calibration mode that generates a click train — short impulses at roughly 2 
 
 This feature is more important than it sounds. Without it, calibrating a 112 ms offset is miserable guesswork.
 
+**Placement constraint (from milestone 6):** inject the click train *after* the channel-adaptation stage, or before it into FL/FR only. A click injected pre-adaptation into the center or a surround channel arrives -3 dB on a downmixing chain and full-scale on a passthrough chain — level differing per output defeats the fuse-by-ear comparison.
+
 ---
 
 ## Milestones

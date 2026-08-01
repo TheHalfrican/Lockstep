@@ -22,6 +22,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use rtrb::{Producer, RingBuffer};
 
+use super::channelmap::ChannelPlan;
 use super::command::{Command, pair_delays};
 use super::render::RenderConfig;
 use super::{MAX_SINKS, SharedState, SinkState, capture, render};
@@ -64,6 +65,10 @@ pub struct SinkPlan {
     /// The endpoint's `IMMDevice::GetId()` string — its real identity.
     pub device_id: String,
     pub delay_ms: f64,
+    /// How this sink's channel layout is reached from the source's. Resolved
+    /// again from the live format inside the render thread; this copy is for
+    /// reporting, so a session that is downmixing says so.
+    pub adaptation: ChannelPlan,
 }
 
 /// Why a command could not be delivered.
@@ -129,7 +134,8 @@ impl Session {
         let mut plans: Vec<SinkPlan> = Vec::with_capacity(sink_count);
         for (position, sink) in config.sinks.iter().enumerate() {
             let sink_format = validate(sink, "sink")?;
-            require_matching_formats(config.source, source_format, sink, sink_format)?;
+            let adaptation =
+                require_compatible_formats(config.source, source_format, sink, sink_format)?;
 
             let device_id = sink
                 .id
@@ -155,6 +161,7 @@ impl Session {
                 label: format!("[{}] {}", sink.index, display_name(sink)),
                 device_id,
                 delay_ms: delays[position],
+                adaptation,
             });
         }
 
@@ -375,28 +382,46 @@ pub fn validate(device: &DeviceInfo, role: &str) -> Result<MixFormat> {
     Ok(format)
 }
 
-pub fn require_matching_formats(
+/// Check that one source/sink pairing can be bridged, and say how.
+///
+/// Two different questions, deliberately not merged. **Sample rates must match
+/// exactly** — nothing in this build converts them, and pretending otherwise
+/// would pitch-shift the output. **Channel counts need not match at all**: the
+/// adaptation stage bridges them, and the only pairings it refuses are the ones
+/// that would silently throw source channels away.
+pub fn require_compatible_formats(
     source: &DeviceInfo,
     source_format: MixFormat,
     sink: &DeviceInfo,
     sink_format: MixFormat,
-) -> Result<()> {
-    if source_format.sample_rate == sink_format.sample_rate
-        && source_format.channels == sink_format.channels
-    {
-        return Ok(());
+) -> Result<ChannelPlan> {
+    if source_format.sample_rate != sink_format.sample_rate {
+        bail!(
+            "source and sink sample rates differ and this build does no rate conversion:\n  \
+             source [{}] {}: {}\n  sink   [{}] {}: {}\n\
+             Set both endpoints to the same rate in Windows Sound settings.",
+            source.index,
+            display_name(source),
+            source_format.summary(),
+            sink.index,
+            display_name(sink),
+            sink_format.summary(),
+        );
     }
-    bail!(
-        "source and sink mix formats differ and this build does no conversion:\n  \
-         source [{}] {}: {}\n  sink   [{}] {}: {}\n\
-         Sample-rate and channel-count conversion arrive with the downmix stage.",
-        source.index,
-        display_name(source),
-        source_format.summary(),
-        sink.index,
-        display_name(sink),
-        sink_format.summary(),
-    );
+
+    match ChannelPlan::new(source_format.channel_layout(), sink_format.channel_layout()) {
+        Ok(plan) => Ok(plan),
+        Err(error) => bail!(
+            "source and sink speaker layouts cannot be bridged:\n  \
+             source [{}] {}: {}\n  sink   [{}] {}: {}\n  {error}",
+            source.index,
+            display_name(source),
+            source_format.summary(),
+            sink.index,
+            display_name(sink),
+            sink_format.summary(),
+        ),
+    }
 }
 
 pub fn display_name(device: &DeviceInfo) -> &str {
@@ -414,6 +439,14 @@ mod tests {
     use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 
     fn format(sample_rate: u32, channels: u16, float: bool) -> MixFormat {
+        // Whatever the canonical mask for that many channels is, so these
+        // fixtures look like the endpoints on the target system.
+        let channel_mask = match channels {
+            2 => 0x3,
+            6 => 0x3F,
+            8 => 0x63F,
+            _ => 0,
+        };
         MixFormat {
             format_tag: 0xFFFE,
             channels,
@@ -424,7 +457,7 @@ mod tests {
             cb_size: 22,
             extensible: Some(ExtensibleFormat {
                 valid_bits_per_sample: 32,
-                channel_mask: 0x3,
+                channel_mask,
                 sub_format: if float {
                     KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
                 } else {
@@ -485,11 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn matching_formats_are_accepted() {
+    fn matching_formats_are_accepted_and_need_no_adaptation() {
         let source = device(0, EndpointState::Active, None);
         let sink = device(1, EndpointState::Active, None);
         let f = format(48_000, 2, true);
-        assert!(require_matching_formats(&source, f, &sink, f).is_ok());
+        let plan = require_compatible_formats(&source, f, &sink, f).expect("identical formats");
+        assert!(plan.is_passthrough());
     }
 
     #[test]
@@ -498,7 +532,7 @@ mod tests {
         let sink = device(1, EndpointState::Active, None);
         let error = format!(
             "{}",
-            require_matching_formats(
+            require_compatible_formats(
                 &source,
                 format(48_000, 2, true),
                 &sink,
@@ -508,24 +542,55 @@ mod tests {
         );
         assert!(error.contains("48000 Hz"), "{error}");
         assert!(error.contains("44100 Hz"), "{error}");
+        assert!(error.contains("rate conversion"), "{error}");
     }
 
     #[test]
-    fn a_channel_count_mismatch_names_both_formats() {
+    fn a_channel_count_mismatch_is_accepted_in_both_directions() {
+        // The measured pairings: a 5.1 HDMI endpoint and a stereo headset, in
+        // whichever role the user puts them.
+        let source = device(0, EndpointState::Active, None);
+        let sink = device(1, EndpointState::Active, None);
+
+        let down = require_compatible_formats(
+            &source,
+            format(48_000, 6, true),
+            &sink,
+            format(48_000, 2, true),
+        )
+        .expect("6 into 2 downmixes");
+        assert!(down.summary().contains("BS.775"), "{}", down.summary());
+
+        let up = require_compatible_formats(
+            &source,
+            format(48_000, 2, true),
+            &sink,
+            format(48_000, 6, true),
+        )
+        .expect("2 into 6 upmaps");
+        assert_eq!(up.source_channels(), 2);
+        assert_eq!(up.sink_channels(), 6);
+    }
+
+    #[test]
+    fn a_layout_that_cannot_be_bridged_names_both_formats() {
+        // 7.1 down to back-pair 5.1 would drop the side surrounds, which is a
+        // silent content loss and so is refused.
         let source = device(0, EndpointState::Active, None);
         let sink = device(1, EndpointState::Active, None);
         let error = format!(
             "{}",
-            require_matching_formats(
+            require_compatible_formats(
                 &source,
-                format(48_000, 2, true),
+                format(48_000, 8, true),
                 &sink,
                 format(48_000, 6, true)
             )
             .unwrap_err()
         );
-        assert!(error.contains("2 ch"), "{error}");
+        assert!(error.contains("8 ch"), "{error}");
         assert!(error.contains("6 ch"), "{error}");
+        assert!(error.contains("SL"), "{error}");
     }
 
     #[test]

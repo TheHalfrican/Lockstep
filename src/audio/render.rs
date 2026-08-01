@@ -9,10 +9,18 @@
 //! # Drift correction
 //!
 //! With correction enabled this thread owns the per-sink half of the CLAUDE.md
-//! signal chain: `ring → [ASRC] → endpoint`. A [`DriftController`] watches ring
-//! occupancy and trims the resampler ratio by a few ppm so the ring holds its
-//! setpoint indefinitely, cancelling the difference between the capture and
-//! render clocks.
+//! signal chain: `ring → [downmix] → [delay] → [ASRC] → endpoint`. A
+//! [`DriftController`] watches ring occupancy and trims the resampler ratio by a
+//! few ppm so the ring holds its setpoint indefinitely, cancelling the
+//! difference between the capture and render clocks.
+//!
+//! # Two channel counts
+//!
+//! The ring arrives in the *source* endpoint's channel count and the endpoint
+//! buffer wants the *sink's*. [`InputStage`] is the boundary: everything
+//! upstream of it counts in source channels, everything downstream in sink
+//! channels. Frame counts are the same on both sides, only samples per frame
+//! differ, so ring accounting and the drift controller are untouched by it.
 //!
 //! The uncorrected path is kept intact and reachable with `--no-correction`.
 //! It is not dead code: TARGETSYSTEMQUEUE.md's drift measurements depend on
@@ -35,6 +43,7 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, IAudioRenderClient,
 };
 
+use super::channelmap::ChannelPlan;
 use super::command::Command;
 use super::control::{ControllerConfig, DriftController};
 use super::delay::{DelayLine, MAX_DELAY_MS, ms_to_frames};
@@ -102,70 +111,116 @@ pub struct RenderConfig {
     pub delay_ms: f64,
 }
 
-/// The delay stage: `ring → [delay] → …`, the first processing block in the
-/// CLAUDE.md chain.
+/// The ring-side stage: `ring → [downmix] → [delay] → …`, the first two
+/// processing blocks in the CLAUDE.md chain.
 ///
-/// It sits on the resampler's *input* side, in the source clock domain. That is
-/// where the architecture diagram puts it, and it is also the only place that
-/// works for the click-train calibration mode, which injects impulses *before*
-/// the delay so the user can hear the two outputs fuse.
+/// It sits on the resampler's *input* side. That is where the architecture
+/// diagram puts the delay, and it is also the only place that works for the
+/// click-train calibration mode, which injects impulses *before* the delay so
+/// the user can hear the two outputs fuse.
 ///
-/// Because it consumes exactly as many frames as it emits, inserting it changes
-/// nothing about ring occupancy or the drift controller's job.
-struct DelayStage {
+/// Channel adaptation comes first, so everything downstream of this line — the
+/// delay buffer, the resampler, the staging FIFO, the endpoint write — runs in
+/// the *sink's* channel count and never has to think about the source's. The
+/// ring on the other side stays in the source's count, because there is one
+/// capture stream feeding two sinks that may disagree.
+///
+/// Because both blocks emit exactly as many frames as they consume, inserting
+/// them changes nothing about ring occupancy or the drift controller's job.
+struct InputStage {
     line: DelayLine,
-    /// Frames gathered from the ring, before the delay.
+    plan: ChannelPlan,
+    /// Frames gathered from the ring, in the source layout.
     raw: Vec<f32>,
-    /// The same frames after the delay. Two buffers because `DelayLine::process`
-    /// takes distinct input and output slices — it reads its own history while
-    /// writing, so aliasing them would be wrong.
+    /// The same frames in the sink layout. Empty when the plan is a passthrough:
+    /// then `raw` feeds the delay line directly and the adaptation costs nothing
+    /// at all, not even a copy.
+    adapted: Vec<f32>,
+    /// After the delay, in the sink layout. A third buffer because
+    /// `DelayLine::process` takes distinct input and output slices — it reads
+    /// its own history while writing, so aliasing them would be wrong.
     delayed: Vec<f32>,
-    channels: usize,
+    source_channels: usize,
+    sink_channels: usize,
 }
 
-impl DelayStage {
+impl InputStage {
     /// Allocates; setup only.
     fn new(
         sample_rate: u32,
-        channels: usize,
+        plan: ChannelPlan,
         max_block_frames: usize,
         initial_delay_ms: f64,
     ) -> Result<Self, super::delay::DelayConfigError> {
-        let mut line = DelayLine::new(sample_rate, channels, MAX_DELAY_MS, max_block_frames)?;
+        let source_channels = plan.source_channels();
+        let sink_channels = plan.sink_channels();
+
+        let mut line = DelayLine::new(sample_rate, sink_channels, MAX_DELAY_MS, max_block_frames)?;
         // Nothing is in flight before the stream starts, so the startup delay
         // is applied as a jump rather than a crossfade.
         line.set_delay_frames_immediate(ms_to_frames(initial_delay_ms, sample_rate));
 
-        Ok(DelayStage {
+        Ok(InputStage {
             line,
-            raw: vec![0.0; max_block_frames * channels],
-            delayed: vec![0.0; max_block_frames * channels],
-            channels,
+            plan,
+            raw: vec![0.0; max_block_frames * source_channels],
+            adapted: if plan.is_passthrough() {
+                Vec::new()
+            } else {
+                vec![0.0; max_block_frames * sink_channels]
+            },
+            delayed: vec![0.0; max_block_frames * sink_channels],
+            source_channels,
+            sink_channels,
         })
     }
 
-    /// Take `frames` whole frames from the ring and return them delayed.
+    fn source_channels(&self) -> usize {
+        self.source_channels
+    }
+
+    fn sink_channels(&self) -> usize {
+        self.sink_channels
+    }
+
+    /// Take `frames` whole frames from the ring and return them adapted to the
+    /// sink layout and delayed.
+    ///
+    /// `frames` counts frames, which both layouts agree on — only the samples
+    /// per frame differ, so the returned slice is `frames * sink_channels` long
+    /// however many channels came off the ring.
     ///
     /// `None` when the ring holds less than a whole `frames`, in which case
     /// nothing has been consumed — the caller pads and counts an underrun.
     fn pull(&mut self, consumer: &mut Consumer<f32>, frames: usize) -> Option<&[f32]> {
-        let samples = frames * self.channels;
-        if samples > self.raw.len() {
+        let in_samples = frames * self.source_channels;
+        let out_samples = frames * self.sink_channels;
+        if in_samples > self.raw.len() || out_samples > self.delayed.len() {
             return None;
         }
-        if frames_to_move(consumer.slots(), self.channels, frames) < frames {
+        if frames_to_move(consumer.slots(), self.source_channels, frames) < frames {
             return None;
         }
 
-        let chunk = consumer.read_chunk(samples).ok()?;
+        let chunk = consumer.read_chunk(in_samples).ok()?;
         let (first, second) = chunk.as_slices();
-        let copied = gather_interleaved(&mut self.raw[..samples], first, second);
+        let copied = gather_interleaved(&mut self.raw[..in_samples], first, second);
         chunk.commit_all();
-        debug_assert_eq!(copied, samples);
+        debug_assert_eq!(copied, in_samples);
+
+        let into_delay: &[f32] = if self.plan.is_passthrough() {
+            &self.raw[..in_samples]
+        } else {
+            let converted = self
+                .plan
+                .process(&self.raw[..in_samples], &mut self.adapted[..out_samples]);
+            debug_assert_eq!(converted, frames);
+            &self.adapted[..out_samples]
+        };
 
         self.line
-            .process(&self.raw[..samples], &mut self.delayed[..samples]);
-        Some(&self.delayed[..samples])
+            .process(into_delay, &mut self.delayed[..out_samples]);
+        Some(&self.delayed[..out_samples])
     }
 
     /// Apply every command waiting for this sink.
@@ -195,8 +250,8 @@ struct ResampleStage {
     fifo: SampleFifo,
     /// Interleaved frames the resampler produced, before they reach the FIFO.
     ///
-    /// There is no matching input scratch: input arrives already gathered and
-    /// delayed from [`DelayStage::pull`], which owns those two buffers.
+    /// There is no matching input scratch: input arrives already gathered,
+    /// adapted and delayed from [`InputStage::pull`], which owns those buffers.
     output_scratch: Vec<f32>,
     channels: usize,
     sample_rate: f64,
@@ -294,13 +349,13 @@ impl ResampleStage {
     /// Resample from the ring into the FIFO until it holds `wanted_frames`, or
     /// the ring runs dry.
     ///
-    /// Input arrives via `delay`, so the chain here is exactly the CLAUDE.md
-    /// one: `ring → [delay] → [ASRC] → endpoint`.
+    /// Input arrives via `input`, so the chain here is exactly the CLAUDE.md
+    /// one: `ring → [downmix] → [delay] → [ASRC] → endpoint`.
     ///
     /// Returns the number of input frames taken from the ring.
     fn produce(
         &mut self,
-        delay: &mut DelayStage,
+        input_stage: &mut InputStage,
         consumer: &mut Consumer<f32>,
         wanted_frames: usize,
     ) -> Result<usize, ()> {
@@ -319,7 +374,7 @@ impl ResampleStage {
             // and would splice silence into the middle of the stream. Better to
             // let the caller pad the tail and count one underrun. `pull`
             // consumes nothing when it returns None.
-            let Some(delayed) = delay.pull(consumer, need_frames) else {
+            let Some(delayed) = input_stage.pull(consumer, need_frames) else {
                 break;
             };
             consumed_frames += need_frames;
@@ -410,13 +465,31 @@ fn setup_and_run(
             }
         };
 
+        // The endpoint may have renegotiated between enumeration and now. The
+        // sample rate must still match exactly — nothing in this build converts
+        // rates — but the channel count is allowed to differ from the source's,
+        // and from what enumeration reported, as long as a plan exists for it.
         let format = activated.format();
-        if format.sample_rate != expected.sample_rate || format.channels != expected.channels {
+        if format.sample_rate != expected.sample_rate {
             sink.fault
                 .record(FaultStage::FormatMismatch, windows::core::HRESULT(0));
             return Err(());
         }
-        let channels = format.channels as usize;
+
+        // Built here, once, from the live formats on both sides: everything
+        // that runs per callback is a table lookup over this.
+        let plan = match ChannelPlan::new(expected.channel_layout(), format.channel_layout()) {
+            Ok(plan) => plan,
+            Err(_) => {
+                sink.fault
+                    .record(FaultStage::ChannelMap, windows::core::HRESULT(0));
+                return Err(());
+            }
+        };
+        // Downstream of the adaptation everything is in the sink's count; the
+        // ring upstream of it is in the source's.
+        let channels = plan.sink_channels();
+        let source_channels = plan.source_channels();
 
         let event = match EventHandle::new() {
             Ok(event) => event,
@@ -483,27 +556,23 @@ fn setup_and_run(
             None
         };
 
-        // The delay stage sizes its scratch for the biggest block anyone will
+        // The input stage sizes its scratch for the biggest block anyone will
         // ask it for: the resampler's widest input request when correcting, or
         // a whole endpoint buffer when not.
         let max_block_frames = match stage.as_ref() {
             Some(stage) => stage.resampler.input_frames_max(),
             None => buffer_frames as usize,
         };
-        let mut delay = match DelayStage::new(
-            format.sample_rate,
-            channels,
-            max_block_frames,
-            config.delay_ms,
-        ) {
-            Ok(delay) => delay,
-            Err(_) => {
-                sink.fault
-                    .record(FaultStage::DelayInit, windows::core::HRESULT(0));
-                return Err(());
-            }
-        };
-        sink.set_delay_frames(delay.line.delay_frames() as u64);
+        let mut input_stage =
+            match InputStage::new(format.sample_rate, plan, max_block_frames, config.delay_ms) {
+                Ok(input_stage) => input_stage,
+                Err(_) => {
+                    sink.fault
+                        .record(FaultStage::DelayInit, windows::core::HRESULT(0));
+                    return Err(());
+                }
+            };
+        sink.set_delay_frames(input_stage.line.delay_frames() as u64);
 
         // Starts at the gain already selected, so opening a session on a
         // pre-set fader does not ramp up from silence.
@@ -514,7 +583,7 @@ fn setup_and_run(
         // no-blocking rule does not apply.
         let deadline = Instant::now() + PREBUFFER_TIMEOUT;
         while !shared.should_stop()
-            && consumer.slots() < prebuffer_frames * channels
+            && consumer.slots() < prebuffer_frames * source_channels
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(1));
@@ -568,8 +637,8 @@ fn setup_and_run(
             // Parameter changes land at the top of the callback, before any
             // audio moves, so a change always applies to a whole block rather
             // than taking effect halfway through one.
-            delay.drain_commands(commands);
-            sink.set_delay_frames(delay.line.delay_frames() as u64);
+            input_stage.drain_commands(commands);
+            sink.set_delay_frames(input_stage.line.delay_frames() as u64);
 
             let padding = match activated.client.GetCurrentPadding() {
                 Ok(padding) => padding,
@@ -584,7 +653,7 @@ fn setup_and_run(
                 continue;
             }
 
-            if !primed && consumer.slots() / channels >= prebuffer_frames {
+            if !primed && consumer.slots() / source_channels >= prebuffer_frames {
                 primed = true;
                 sink.primed.store(true, Ordering::Release);
             }
@@ -605,23 +674,22 @@ fn setup_and_run(
                         &render_client,
                         sink,
                         stage,
-                        &mut delay,
+                        &mut input_stage,
                         &mut gain,
                         consumer,
                         available,
-                        channels,
                     )
                 }
-                // Uncorrected path: same as milestone 3 apart from the delay
-                // stage, which is exact passthrough at a delay of zero.
+                // Uncorrected path: same as milestone 3 apart from the input
+                // stage, which is exact passthrough at a delay of zero and a
+                // matched layout.
                 None => write_period(
                     &render_client,
                     sink,
-                    &mut delay,
+                    &mut input_stage,
                     &mut gain,
                     consumer,
                     available,
-                    channels,
                 ),
             };
             if result.is_err() {
@@ -645,28 +713,36 @@ fn setup_and_run(
 /// Allocation-free: samples are copied straight from the ring's storage into
 /// the buffer WASAPI handed back.
 ///
+/// Two channel counts are in play and they are not interchangeable: the ring is
+/// read in the source's, the endpoint buffer written in the sink's. Both come
+/// off the input stage rather than being passed in, so they cannot be swapped
+/// at a call site.
+///
 /// # Safety
 ///
 /// Caller must hold an initialized render client on a COM-initialized thread.
-#[allow(clippy::too_many_arguments)]
 unsafe fn write_period(
     render_client: &IAudioRenderClient,
     sink: &SinkState,
-    delay: &mut DelayStage,
+    input_stage: &mut InputStage,
     gain: &mut GainRamp,
     consumer: &mut Consumer<f32>,
     frames: u32,
-    channels: usize,
 ) -> Result<(), ()> {
     unsafe {
         let wanted_frames = frames as usize;
+        let channels = input_stage.sink_channels();
 
         // Whole frames only, so channel order can never slip. Pulled before
         // GetBuffer to keep the window between GetBuffer and ReleaseBuffer
         // short.
-        let ready_frames = frames_to_move(consumer.slots(), channels, wanted_frames);
+        let ready_frames = frames_to_move(
+            consumer.slots(),
+            input_stage.source_channels(),
+            wanted_frames,
+        );
         let delayed = if ready_frames > 0 {
-            delay.pull(consumer, ready_frames)
+            input_stage.pull(consumer, ready_frames)
         } else {
             None
         };
@@ -724,26 +800,28 @@ unsafe fn write_period(
 /// works in scratch buffers sized at setup, and the staging FIFO owns a fixed
 /// block.
 ///
+/// Everything past the input stage is in the sink's channel count, so unlike
+/// [`write_period`] this one only ever needs that number.
+///
 /// # Safety
 ///
 /// Caller must hold an initialized render client on a COM-initialized thread.
-#[allow(clippy::too_many_arguments)]
 unsafe fn write_resampled(
     render_client: &IAudioRenderClient,
     sink: &SinkState,
     stage: &mut ResampleStage,
-    delay: &mut DelayStage,
+    input_stage: &mut InputStage,
     gain: &mut GainRamp,
     consumer: &mut Consumer<f32>,
     frames: u32,
-    channels: usize,
 ) -> Result<(), ()> {
     unsafe {
         let wanted_frames = frames as usize;
+        let channels = stage.channels;
 
         // Top the FIFO up before touching the endpoint buffer, so the window
         // between GetBuffer and ReleaseBuffer stays as short as possible.
-        match stage.produce(delay, consumer, wanted_frames) {
+        match stage.produce(input_stage, consumer, wanted_frames) {
             Ok(consumed) => {
                 if consumed > 0 {
                     sink.frames_popped
@@ -870,33 +948,55 @@ fn hresult_of(err: &anyhow::Error) -> windows::core::HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::channelmap::ChannelLayout;
     use rtrb::RingBuffer;
 
     const SAMPLE_RATE: u32 = 48_000;
     const CHANNELS: usize = 2;
     const RING_FRAMES: usize = 24_000;
 
+    /// The two layouts these tests bridge, both measured on the target system.
+    const STEREO: ChannelLayout = ChannelLayout::new(2, 0x0000_0003);
+    const FIVE_ONE: ChannelLayout = ChannelLayout::new(6, 0x0000_003F);
+
     fn stage() -> ResampleStage {
         ResampleStage::new(SAMPLE_RATE, CHANNELS, 12_000.0, 1_920).expect("stage builds")
     }
 
-    /// A delay stage sized for the resampler that feeds it, at zero delay
-    /// unless a test says otherwise.
-    fn delay_stage(stage: &ResampleStage, delay_ms: f64) -> DelayStage {
-        DelayStage::new(
+    /// An input stage sized for the resampler that feeds it, at zero delay and
+    /// matched layouts unless a test says otherwise.
+    fn input_stage(stage: &ResampleStage, delay_ms: f64) -> InputStage {
+        adapting_input_stage(stage, delay_ms, STEREO, STEREO)
+    }
+
+    fn adapting_input_stage(
+        stage: &ResampleStage,
+        delay_ms: f64,
+        source: ChannelLayout,
+        sink: ChannelLayout,
+    ) -> InputStage {
+        let plan = ChannelPlan::new(source, sink).expect("the layouts have a plan");
+        InputStage::new(
             SAMPLE_RATE,
-            CHANNELS,
+            plan,
             stage.resampler.input_frames_max(),
             delay_ms,
         )
-        .expect("delay stage builds")
+        .expect("input stage builds")
     }
 
     /// A ring pre-filled with an interleaved ramp, plus its producer so a test
     /// can keep topping it up.
     fn filled_ring(frames: usize) -> (rtrb::Producer<f32>, rtrb::Consumer<f32>) {
-        let (mut producer, consumer) = RingBuffer::<f32>::new(RING_FRAMES * CHANNELS);
-        for i in 0..frames * CHANNELS {
+        filled_ring_of(frames, CHANNELS)
+    }
+
+    fn filled_ring_of(
+        frames: usize,
+        channels: usize,
+    ) -> (rtrb::Producer<f32>, rtrb::Consumer<f32>) {
+        let (mut producer, consumer) = RingBuffer::<f32>::new(RING_FRAMES * channels);
+        for i in 0..frames * channels {
             producer.push(i as f32).expect("ring has room");
         }
         (producer, consumer)
@@ -905,11 +1005,16 @@ mod tests {
     #[test]
     fn the_stage_builds_with_buffers_big_enough_for_the_widest_ratio() {
         let stage = stage();
-        let delay = delay_stage(&stage, 0.0);
-        // The delay stage owns both input buffers now, and they must cover the
-        // most the resampler can ever ask for or a callback would allocate.
-        assert!(delay.raw.len() >= stage.resampler.input_frames_max() * CHANNELS);
-        assert!(delay.delayed.len() >= stage.resampler.input_frames_max() * CHANNELS);
+        let input = input_stage(&stage, 0.0);
+        // The input stage owns every buffer on the resampler's input side, and
+        // they must cover the most it can ever ask for or a callback would
+        // allocate.
+        assert!(input.raw.len() >= stage.resampler.input_frames_max() * CHANNELS);
+        assert!(input.delayed.len() >= stage.resampler.input_frames_max() * CHANNELS);
+        // A matched pairing skips the adaptation entirely, so it does not even
+        // carry the buffer.
+        assert!(input.plan.is_passthrough());
+        assert!(input.adapted.is_empty());
         assert!(stage.output_scratch.len() >= stage.resampler.output_frames_max() * CHANNELS);
         assert!(stage.fifo.capacity() >= (1_920 + 2 * RESAMPLER_CHUNK_FRAMES) * CHANNELS);
     }
@@ -917,11 +1022,11 @@ mod tests {
     #[test]
     fn a_ratio_of_one_consumes_about_as_many_frames_as_it_produces() {
         let mut stage = stage();
-        let mut delay = delay_stage(&stage, 0.0);
+        let mut input = input_stage(&stage, 0.0);
         let (_producer, mut consumer) = filled_ring(12_000);
 
         let consumed = stage
-            .produce(&mut delay, &mut consumer, RESAMPLER_CHUNK_FRAMES)
+            .produce(&mut input, &mut consumer, RESAMPLER_CHUNK_FRAMES)
             .expect("produce succeeds");
 
         assert!(stage.fifo.len() >= RESAMPLER_CHUNK_FRAMES * CHANNELS);
@@ -940,11 +1045,11 @@ mod tests {
         // let the caller pad the endpoint buffer, rather than feeding the
         // resampler a partial chunk.
         let mut stage = stage();
-        let mut delay = delay_stage(&stage, 0.0);
+        let mut input = input_stage(&stage, 0.0);
         let (_producer, mut consumer) = filled_ring(16);
 
         let consumed = stage
-            .produce(&mut delay, &mut consumer, RESAMPLER_CHUNK_FRAMES)
+            .produce(&mut input, &mut consumer, RESAMPLER_CHUNK_FRAMES)
             .unwrap();
 
         assert_eq!(consumed, 0);
@@ -958,10 +1063,10 @@ mod tests {
         // The delay stage is where partial-chunk handling lives now, so pin the
         // all-or-nothing contract directly.
         let stage = stage();
-        let mut delay = delay_stage(&stage, 0.0);
+        let mut input = input_stage(&stage, 0.0);
         let (_producer, mut consumer) = filled_ring(10);
 
-        assert!(delay.pull(&mut consumer, 480).is_none());
+        assert!(input.pull(&mut consumer, 480).is_none());
         assert_eq!(consumer.slots(), 10 * CHANNELS);
     }
 
@@ -970,10 +1075,10 @@ mod tests {
         // The `--no-correction` path runs through the delay stage too, so at a
         // delay of zero it has to be exactly transparent or that path regresses.
         let stage = stage();
-        let mut delay = delay_stage(&stage, 0.0);
+        let mut input = input_stage(&stage, 0.0);
         let (_producer, mut consumer) = filled_ring(1_000);
 
-        let out = delay.pull(&mut consumer, 480).expect("ring has enough");
+        let out = input.pull(&mut consumer, 480).expect("ring has enough");
         let expected: Vec<f32> = (0..480 * CHANNELS).map(|i| i as f32).collect();
         assert_eq!(out, expected.as_slice());
     }
@@ -982,69 +1087,157 @@ mod tests {
     fn a_delayed_stage_emits_silence_until_the_line_fills() {
         let stage = stage();
         // 10 ms of delay: 480 frames of silence before real audio appears.
-        let mut delay = delay_stage(&stage, 10.0);
+        let mut input = input_stage(&stage, 10.0);
         let (_producer, mut consumer) = filled_ring(2_000);
 
-        let out = delay.pull(&mut consumer, 480).expect("ring has enough");
+        let out = input.pull(&mut consumer, 480).expect("ring has enough");
         assert!(out.iter().all(|s| *s == 0.0), "expected startup silence");
 
-        let out = delay.pull(&mut consumer, 480).expect("ring has enough");
+        let out = input.pull(&mut consumer, 480).expect("ring has enough");
         // Now the first block comes back out.
         let expected: Vec<f32> = (0..480 * CHANNELS).map(|i| i as f32).collect();
         assert_eq!(out, expected.as_slice());
     }
 
     #[test]
-    fn the_delay_stage_applies_queued_commands() {
+    fn the_input_stage_applies_queued_commands() {
         let stage = stage();
-        let mut delay = delay_stage(&stage, 0.0);
+        let mut input = input_stage(&stage, 0.0);
         let (mut sender, mut receiver) = RingBuffer::<Command>::new(8);
 
         sender.push(Command::SetDelayFrames(2_400)).unwrap();
         sender.push(Command::SetDelayFrames(1_200)).unwrap();
-        delay.drain_commands(&mut receiver);
+        input.drain_commands(&mut receiver);
 
         // Both were applied: the first started a crossfade, the second was
         // coalesced into the delay line's pending slot.
-        assert_eq!(delay.line.delay_frames(), 2_400);
-        assert_eq!(delay.line.pending_delay_frames(), Some(1_200));
-        assert!(delay.line.is_crossfading());
+        assert_eq!(input.line.delay_frames(), 2_400);
+        assert_eq!(input.line.pending_delay_frames(), Some(1_200));
+        assert!(input.line.is_crossfading());
     }
 
     #[test]
     fn draining_an_empty_command_queue_is_a_no_op() {
         let stage = stage();
-        let mut delay = delay_stage(&stage, 0.0);
+        let mut input = input_stage(&stage, 0.0);
         let (_sender, mut receiver) = RingBuffer::<Command>::new(8);
 
-        delay.drain_commands(&mut receiver);
-        assert_eq!(delay.line.delay_frames(), 0);
-        assert!(!delay.line.is_crossfading());
+        input.drain_commands(&mut receiver);
+        assert_eq!(input.line.delay_frames(), 0);
+        assert!(!input.line.is_crossfading());
     }
 
     #[test]
     fn a_startup_delay_is_applied_without_a_crossfade() {
         let stage = stage();
-        let delay = delay_stage(&stage, 120.0);
-        assert_eq!(delay.line.delay_frames(), 5_760);
+        let input = input_stage(&stage, 120.0);
+        assert_eq!(input.line.delay_frames(), 5_760);
         assert!(
-            !delay.line.is_crossfading(),
+            !input.line.is_crossfading(),
             "startup delay must not crossfade — there is nothing in flight yet"
         );
     }
 
     #[test]
-    fn the_delay_stage_consumes_exactly_what_it_emits() {
+    fn the_input_stage_consumes_exactly_what_it_emits() {
         // Why inserting the delay leaves ring occupancy and the drift
         // controller completely undisturbed.
         let stage = stage();
-        let mut delay = delay_stage(&stage, 25.0);
+        let mut input = input_stage(&stage, 25.0);
         let (_producer, mut consumer) = filled_ring(12_000);
 
         let before = consumer.slots();
-        let out = delay.pull(&mut consumer, 500).expect("ring has enough");
+        let out = input.pull(&mut consumer, 500).expect("ring has enough");
         assert_eq!(out.len(), 500 * CHANNELS);
         assert_eq!(before - consumer.slots(), 500 * CHANNELS);
+    }
+
+    // ---- channel adaptation, spliced between the ring and the delay ----
+
+    #[test]
+    fn a_downmixing_stage_narrows_ring_frames_to_the_sink_layout() {
+        // 5.1 source, stereo sink: the ring is read six samples per frame and
+        // the delay line, the resampler and the endpoint all see two.
+        let stage = ResampleStage::new(SAMPLE_RATE, 2, 12_000.0, 1_920).expect("stage builds");
+        let mut input = adapting_input_stage(&stage, 0.0, FIVE_ONE, STEREO);
+        let (_producer, mut consumer) = filled_ring_of(1_000, 6);
+
+        assert_eq!(input.source_channels(), 6);
+        assert_eq!(input.sink_channels(), 2);
+
+        let before = consumer.slots();
+        let out = input.pull(&mut consumer, 480).expect("ring has enough");
+
+        // Frames in equal frames out; only the samples per frame changed.
+        assert_eq!(before - consumer.slots(), 480 * 6);
+        assert_eq!(out.len(), 480 * 2);
+
+        // First ring frame is 0,1,2,3,4,5 — check it against the BS.775 fold.
+        const FOLD: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((out[0] - (0.0 + FOLD * 2.0 + FOLD * 4.0)).abs() < 1e-5);
+        assert!((out[1] - (1.0 + FOLD * 2.0 + FOLD * 5.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn an_upmapping_stage_widens_ring_frames_to_the_sink_layout() {
+        // Stereo source, 5.1 sink: two samples per ring frame become six, with
+        // the four the source cannot fill left silent.
+        let stage = ResampleStage::new(SAMPLE_RATE, 6, 12_000.0, 1_920).expect("stage builds");
+        let mut input = adapting_input_stage(&stage, 0.0, STEREO, FIVE_ONE);
+        let (_producer, mut consumer) = filled_ring(1_000);
+
+        let before = consumer.slots();
+        let out = input.pull(&mut consumer, 480).expect("ring has enough");
+
+        assert_eq!(before - consumer.slots(), 480 * 2);
+        assert_eq!(out.len(), 480 * 6);
+        for (frame, out) in out.chunks_exact(6).enumerate() {
+            assert_eq!(out[0], (frame * 2) as f32);
+            assert_eq!(out[1], (frame * 2 + 1) as f32);
+            assert!(
+                out[2..].iter().all(|s| *s == 0.0),
+                "frame {frame} was noisy"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptation_happens_before_the_delay_line() {
+        // The order matters: a delay line built for the sink's channel count
+        // could not hold source frames at all. Ten milliseconds of delay must
+        // therefore come out as 480 frames of *sink-width* silence.
+        let stage = ResampleStage::new(SAMPLE_RATE, 6, 12_000.0, 1_920).expect("stage builds");
+        let mut input = adapting_input_stage(&stage, 10.0, STEREO, FIVE_ONE);
+        let (_producer, mut consumer) = filled_ring(2_000);
+
+        let out = input.pull(&mut consumer, 480).expect("ring has enough");
+        assert_eq!(out.len(), 480 * 6);
+        assert!(out.iter().all(|s| *s == 0.0), "expected startup silence");
+
+        let out = input.pull(&mut consumer, 480).expect("ring has enough");
+        assert_eq!(out[0], 0.0, "the first ring frame should arrive now");
+        assert_eq!(out[1], 1.0);
+        assert_eq!(out[6], 2.0, "second frame, still upmapped");
+    }
+
+    #[test]
+    fn an_adapting_stage_feeds_the_resampler_in_the_sinks_channel_count() {
+        // End to end through the real rubato instance: a 5.1 ring driving a
+        // stereo endpoint has to produce stereo chunks, not six-channel ones.
+        let mut stage = ResampleStage::new(SAMPLE_RATE, 2, 12_000.0, 1_920).expect("stage builds");
+        let mut input = adapting_input_stage(&stage, 0.0, FIVE_ONE, STEREO);
+        let (_producer, mut consumer) = filled_ring_of(12_000, 6);
+
+        let consumed = stage
+            .produce(&mut input, &mut consumer, RESAMPLER_CHUNK_FRAMES)
+            .expect("produce succeeds");
+
+        assert!(consumed > 0);
+        let produced_frames = stage.fifo.len() / 2;
+        assert!(
+            consumed.abs_diff(produced_frames) <= 4,
+            "consumed {consumed} source frames to produce {produced_frames} sink frames"
+        );
     }
 
     /// Hold the ring at a fixed occupancy while the stage runs, then report the
@@ -1056,7 +1249,7 @@ mod tests {
     /// 1.0.
     fn run_at_occupancy(occupancy: u64) -> (f64, f64) {
         let mut stage = stage();
-        let mut delay = delay_stage(&stage, 0.0);
+        let mut input = input_stage(&stage, 0.0);
         let shared = SharedState::new(1, RING_FRAMES as u64);
         let sink = shared.sink(0);
         let (mut producer, mut consumer) = filled_ring(12_000);
@@ -1070,7 +1263,7 @@ mod tests {
 
             stage.steer(sink, RESAMPLER_CHUNK_FRAMES);
             let consumed = stage
-                .produce(&mut delay, &mut consumer, RESAMPLER_CHUNK_FRAMES)
+                .produce(&mut input, &mut consumer, RESAMPLER_CHUNK_FRAMES)
                 .unwrap();
             sink.frames_popped
                 .fetch_add(consumed as u64, Ordering::Relaxed);
@@ -1155,12 +1348,12 @@ mod tests {
         use std::time::Instant;
 
         let mut stage = stage();
-        let mut delay = delay_stage(&stage, 0.0);
+        let mut input = input_stage(&stage, 0.0);
         let (mut producer, mut consumer) = filled_ring(12_000);
 
         // Warm the caches and the branch predictors first.
         for _ in 0..100 {
-            let _ = stage.produce(&mut delay, &mut consumer, RESAMPLER_CHUNK_FRAMES);
+            let _ = stage.produce(&mut input, &mut consumer, RESAMPLER_CHUNK_FRAMES);
             let mut sink_dst = vec![0.0f32; RESAMPLER_CHUNK_FRAMES * CHANNELS];
             stage.fifo.pop(&mut sink_dst);
             while producer.slots() >= CHANNELS {
@@ -1174,7 +1367,7 @@ mod tests {
         let mut dst = vec![0.0f32; RESAMPLER_CHUNK_FRAMES * CHANNELS];
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = stage.produce(&mut delay, &mut consumer, RESAMPLER_CHUNK_FRAMES);
+            let _ = stage.produce(&mut input, &mut consumer, RESAMPLER_CHUNK_FRAMES);
             stage.fifo.pop(&mut dst);
             while producer.slots() >= CHANNELS {
                 if producer.push(0.5).is_err() {

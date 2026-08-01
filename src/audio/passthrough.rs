@@ -96,6 +96,7 @@ fn print_header(
         println!("sink {index}   {}", plan.label);
         println!("         {}", plan.device_id);
         println!("         delay {:.1} ms at startup", plan.delay_ms);
+        println!("         channels {}", plan.adaptation.summary());
     }
     println!("format   {}", session.format().summary());
     println!(

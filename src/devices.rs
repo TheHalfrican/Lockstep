@@ -33,6 +33,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::core::{GUID, HSTRING};
 
+use crate::audio::channelmap::ChannelLayout;
+
 /// Endpoint lifecycle state, as reported by `IMMDevice::GetState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointState {
@@ -170,6 +172,20 @@ impl MixFormat {
             // 3 == WAVE_FORMAT_IEEE_FLOAT, for the non-extensible case.
             None => self.format_tag == 3,
         }
+    }
+
+    /// This format's speaker layout, for the channel adaptation stage.
+    ///
+    /// A missing extensible tail becomes a mask of zero, which is
+    /// `KSAUDIO_SPEAKER_DIRECTOUT` — "no speaker assignment" — and is exactly
+    /// how [`ChannelLayout`] wants an unknown layout expressed. The conversion
+    /// lives here rather than in `channelmap` so that module stays free of any
+    /// WASAPI type.
+    pub fn channel_layout(&self) -> ChannelLayout {
+        ChannelLayout::new(
+            self.channels as usize,
+            self.extensible.map_or(0, |ext| ext.channel_mask),
+        )
     }
 
     /// Compact one-line rendering, used in "formats don't match" errors.
@@ -802,6 +818,22 @@ mod tests {
         assert!(!mix_format(48_000, 2, 16, 1, None).is_f32());
         // Even when the tag claims float, the width has the final say.
         assert!(!mix_format(48_000, 2, 16, 3, None).is_f32());
+    }
+
+    #[test]
+    fn a_mix_format_hands_its_layout_to_the_channel_mapper() {
+        let layout = shared_mode_f32(48_000, 6, MASK_5_1).channel_layout();
+        assert_eq!(layout.channels(), 6);
+        assert_eq!(layout.mask(), MASK_5_1);
+    }
+
+    #[test]
+    fn a_format_with_no_extensible_tail_reports_an_unassigned_layout() {
+        // Mask zero is KSAUDIO_SPEAKER_DIRECTOUT, which is what the adapter
+        // treats as "positional order is all we know".
+        let layout = mix_format(48_000, 2, 32, 3, None).channel_layout();
+        assert_eq!(layout.channels(), 2);
+        assert_eq!(layout.mask(), 0);
     }
 
     #[test]

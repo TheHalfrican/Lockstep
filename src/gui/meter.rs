@@ -15,6 +15,46 @@ use std::time::Duration;
 /// pixel.
 pub const FLOOR_DB: f32 = -60.0;
 
+/// Top of the healthy range, in dBFS: where the bar stops being green.
+///
+/// The colour zones report **risk of clipping, not loudness**. Lockstep is a
+/// passthrough — it re-renders the same f32 samples the source endpoint already
+/// played — so loud programme material at unity gain cannot clip anything and
+/// is not a fault to correct. A meter that paints it as one teaches the wrong
+/// lesson: it invites turning the outputs down to "keep it in the green", which
+/// only makes the real outputs quieter than the machine feeding them. Green
+/// therefore has to reach all the way up to where clipping actually becomes
+/// possible, and a correctly mastered source at unity must read healthy for its
+/// whole length.
+///
+/// -1 dBFS because that is the true-peak ceiling mastering and streaming
+/// delivery target: material is *built* to sit just under it, so everything
+/// below is by construction the normal, safe operating range.
+///
+/// Note that the meter's -6 dB graticule tick no longer coincides with a colour
+/// change. It stays as a scale landmark for reading level off the bar, which is
+/// a different job from marking a zone edge.
+pub const HOT_DB: f32 = -1.0;
+
+/// Start of genuine clip risk, in dBFS: where the bar turns red.
+///
+/// The amber band between [`HOT_DB`] and here means the signal is riding the
+/// true-peak ceiling: the samples are still under 0 dBFS, but there is no
+/// longer room for the inter-sample peaks a reconstruction filter produces, so
+/// a converter can clip on material that never reads as clipped. -0.3 dBFS is
+/// where that stops being a risk and becomes the expected outcome.
+///
+/// In practice red is reachable only when the material arriving from the source
+/// endpoint is already saturated — the output gain stage attenuates and never
+/// boosts, so nothing downstream of capture can push a level up here. Red that
+/// fires on healthy signal is red nobody reads.
+pub const CLIP_DB: f32 = -0.3;
+
+// Green, then amber, then red, each with room to exist. If these ever cross, a
+// zone vanishes and the meter quietly stops warning about anything; catching it
+// at compile time costs nothing.
+const _: () = assert!(FLOOR_DB < HOT_DB && HOT_DB < CLIP_DB && CLIP_DB < 0.0);
+
 /// How fast the bar falls, in dB per second.
 ///
 /// Slow enough to read at a glance, fast enough to follow programme material.
@@ -119,7 +159,16 @@ pub fn db_fraction(linear: f32) -> f32 {
     if linear <= 0.0 {
         return 0.0;
     }
-    let db = 20.0 * linear.log10();
+    scale_fraction(20.0 * linear.log10())
+}
+
+/// Position of a dBFS landmark on the [`FLOOR_DB`]-to-0 dB scale, as a 0.0–1.0
+/// fraction.
+///
+/// Stated in dB so the zone thresholds and the graticule can be written the way
+/// they are reasoned about, rather than as pre-divided magic numbers that would
+/// silently mean something else if the floor ever moved.
+pub fn scale_fraction(db: f32) -> f32 {
     ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
 }
 
@@ -255,6 +304,26 @@ mod tests {
         // At and below the floor, nothing.
         assert_eq!(db_fraction(10f32.powf(FLOOR_DB / 20.0)), 0.0);
         assert_eq!(db_fraction(1e-9), 0.0);
+    }
+
+    #[test]
+    fn a_decibel_landmark_lands_where_it_belongs_on_the_scale() {
+        assert_eq!(scale_fraction(FLOOR_DB), 0.0);
+        assert_eq!(scale_fraction(0.0), 1.0);
+        assert!((scale_fraction(-30.0) - 0.5).abs() < 1e-6, "midpoint moved");
+
+        // The graticule tick, which is a scale landmark and not a zone edge.
+        assert!((scale_fraction(-6.0) - 0.9).abs() < 1e-6);
+
+        // The two colour-zone boundaries, as positions along the bar. Both live
+        // in the top 2% of the scale, which is the point: everything below is
+        // healthy.
+        assert!((scale_fraction(HOT_DB) - 59.0 / 60.0).abs() < 1e-6);
+        assert!((scale_fraction(CLIP_DB) - 59.7 / 60.0).abs() < 1e-6);
+
+        // Off either end clamps rather than drawing past the rect.
+        assert_eq!(scale_fraction(-120.0), 0.0);
+        assert_eq!(scale_fraction(6.0), 1.0);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rtrb::Producer;
 use windows::Win32::Media::Audio::{
@@ -23,6 +23,7 @@ use windows::Win32::Media::Audio::{
 };
 
 use super::frames::{frames_to_move, scatter_interleaved, scatter_silence};
+use super::idle::{IdleDetector, IdleEvent, SOURCE_IDLE_THRESHOLD};
 use super::rt::{ActivatedClient, ComApartment, EventHandle, MmcssRegistration, WaitOutcome};
 use super::{CapturePacing, FaultStage, MAX_SINKS, SharedState};
 use crate::devices::{MixFormat, open_device_by_id};
@@ -37,7 +38,11 @@ const CAPTURE_BUFFER_DURATION_HNS: i64 = 100 * 10_000;
 ///
 /// Also the detector for the loopback event-handle problem: a client that never
 /// signals will simply time out here, repeatedly.
-const EVENT_WAIT_TIMEOUT_MS: u32 = 100;
+///
+/// Public because it is the coarsest rate at which this thread can notice
+/// anything, which makes it the granularity of source-idle detection too —
+/// [`SOURCE_IDLE_THRESHOLD`] is chosen against it.
+pub const EVENT_WAIT_TIMEOUT_MS: u32 = 100;
 
 /// Consecutive timeouts, with no event ever seen, before giving up on
 /// event-driven pacing and switching to the timer.
@@ -172,6 +177,19 @@ fn setup_and_run(
         let mut consecutive_timeouts: u32 = 0;
         let mut event_ever_fired = false;
 
+        // A paused source stops delivering packets entirely rather than
+        // delivering silence, so the rings would drain and every sink would
+        // read it as a catastrophic underrun. The detector turns that into a
+        // state the render threads can act on.
+        let mut idle = IdleDetector::new(SOURCE_IDLE_THRESHOLD);
+
+        // The one clock on this thread, and it is unavoidable: the thing being
+        // measured is precisely the *absence* of frames, so frames cannot be
+        // the time base the way they are on the render side. `Instant::now` is
+        // a QueryPerformanceCounter read — no allocation, no lock, no blocking
+        // — and this thread already sleeps outright on the polled path.
+        let mut last_pass = Instant::now();
+
         while !shared.should_stop() {
             match pacing {
                 CapturePacing::Event => match event.wait(EVENT_WAIT_TIMEOUT_MS) {
@@ -203,12 +221,26 @@ fn setup_and_run(
 
             // Drain every packet that is ready, regardless of what woke us.
             // This is what makes the two pacing modes interchangeable.
-            if drain_packets(&capture_client, shared, feeds, channels).is_err() {
+            let Ok(delivered) = drain_packets(&capture_client, shared, feeds, channels) else {
                 break;
+            };
+
+            let now = Instant::now();
+            let dt = now.duration_since(last_pass);
+            last_pass = now;
+            match idle.observe(delivered, dt) {
+                IdleEvent::WentIdle => shared.set_source_idle(true),
+                IdleEvent::Resumed => shared.set_source_idle(false),
+                IdleEvent::Unchanged => {}
             }
         }
 
         // ---- real-time region ends ----
+
+        // Nothing is capturing any more, but the flag describes the source, not
+        // this thread; leaving it set would leave the render threads holding
+        // their controllers still on the way out for no reason.
+        shared.set_source_idle(false);
 
         if let Err(err) = activated.client.Stop() {
             shared.capture_fault.record(FaultStage::Stop, err.code());
@@ -251,6 +283,11 @@ unsafe fn activate_and_initialize(
 
 /// Pull every ready packet and fan it out to every sink ring.
 ///
+/// Returns how many frames were delivered across every packet this pass, which
+/// is zero when the endpoint had nothing ready. That figure is the source-idle
+/// signal: an endpoint nothing is rendering to produces no packets at all, not
+/// silent ones.
+///
 /// Allocation-free: `write_chunk_uninit` writes in place into each ring's own
 /// storage.
 ///
@@ -262,8 +299,9 @@ unsafe fn drain_packets(
     shared: &SharedState,
     feeds: &mut SinkFeeds,
     channels: usize,
-) -> Result<(), ()> {
+) -> Result<u64, ()> {
     unsafe {
+        let mut delivered: u64 = 0;
         loop {
             let packet_frames = match capture_client.GetNextPacketSize() {
                 Ok(frames) => frames,
@@ -275,7 +313,7 @@ unsafe fn drain_packets(
                 }
             };
             if packet_frames == 0 {
-                return Ok(());
+                return Ok(delivered);
             }
 
             let mut data: *mut u8 = std::ptr::null_mut();
@@ -292,6 +330,10 @@ unsafe fn drain_packets(
 
             if frames > 0 {
                 let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+                // Counted whether or not the packet is flagged silent: a silent
+                // packet still means the endpoint is running and still fills
+                // the rings, so the source is not idle.
+                delivered += u64::from(frames);
                 shared
                     .frames_captured
                     .fetch_add(u64::from(frames), Ordering::Relaxed);

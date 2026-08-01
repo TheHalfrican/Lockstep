@@ -229,9 +229,14 @@ impl DriftController {
         (self.kp, self.ki)
     }
 
-    /// Drop all history. Test-only until a device-restart path exists to call
-    /// it; hotplug recovery in a later milestone is where it earns its keep.
-    #[cfg(test)]
+    /// Drop all history: filter seed, integrator, output, clamp flag.
+    ///
+    /// Called on the render thread when the source resumes after a pause. The
+    /// ring is refilled from empty by the priming path at that point, so every
+    /// piece of state here describes a ring that no longer exists — and an
+    /// integrator carried across the pause is what would leave the correction
+    /// pinned at the clamp long after the audio came back. Cheap and
+    /// allocation-free: four scalar stores.
     pub fn reset(&mut self) {
         self.filtered_occupancy = None;
         self.integral = 0.0;

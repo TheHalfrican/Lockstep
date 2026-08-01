@@ -541,32 +541,28 @@ impl LockstepApp {
                     format!("{:.1} %", sink.ring_occupancy_percent()),
                 );
 
-                if sink.correction_enabled() {
-                    let clamped = sink.correction_clamped_updates() > 0;
-                    ui.label(
-                        RichText::new("Correction")
-                            .size(11.0)
-                            .color(theme::TEXT_DIM),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "{:+.1} ppm{}",
-                            sink.correction_ppm(),
-                            if clamped { "  CLAMPED" } else { "" }
-                        ))
+                // Off, frozen because the source paused, or a live figure —
+                // the decision is in `SinkState::correction_readout`, tested
+                // there; this is only the colour.
+                let correction = sink.correction_readout(session.shared().source_idle());
+                ui.label(
+                    RichText::new("Correction")
+                        .size(11.0)
+                        .color(theme::TEXT_DIM),
+                );
+                ui.label(
+                    RichText::new(correction.label())
                         .size(11.0)
                         // A controller pinned at its limit is reporting a
-                        // device problem, so it gets a colour.
-                        .color(if clamped {
+                        // device problem, so it gets a colour. An idle source
+                        // is not a problem, so it does not.
+                        .color(if correction.is_alert() {
                             theme::WARNING
                         } else {
                             theme::TEXT
                         }),
-                    );
-                    ui.end_row();
-                } else {
-                    readout(ui, "Correction", "off".to_string());
-                }
+                );
+                ui.end_row();
 
                 let under = sink.underruns.load(std::sync::atomic::Ordering::Relaxed);
                 let over = sink.overruns.load(std::sync::atomic::Ordering::Relaxed);
@@ -671,6 +667,23 @@ impl LockstepApp {
                 .color(theme::TEXT_DIM),
         );
         ui.separator();
+
+        // A paused source looks exactly like a dead one from the meters alone,
+        // so it is named. Global, because there is one capture stream.
+        //
+        // Bright rather than amber, and for the same reason the strip readout
+        // is: everything else in this row that takes a colour is reporting a
+        // fault, and a user pausing their music is not one. Strong against dim
+        // neighbours is enough to find it.
+        if shared.source_idle() {
+            ui.label(
+                RichText::new("SOURCE IDLE")
+                    .size(11.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.separator();
+        }
 
         ui.label(
             RichText::new(format!("{:.0} dBFS", dbfs(self.state.source_meter.level())))

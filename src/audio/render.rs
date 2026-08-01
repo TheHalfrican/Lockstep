@@ -39,6 +39,7 @@ use super::command::Command;
 use super::control::{ControllerConfig, DriftController};
 use super::delay::{DelayLine, MAX_DELAY_MS, ms_to_frames};
 use super::frames::{frames_to_move, gather_interleaved, pad_with_silence, whole_frames};
+use super::idle::SinkGate;
 use super::level::GainRamp;
 use super::rt::{ActivatedClient, ComApartment, EventHandle, MmcssRegistration, WaitOutcome};
 use super::staging::SampleFifo;
@@ -289,6 +290,21 @@ impl ResampleStage {
             .set_resample_ratio_relative(self.controller.relative_ratio(), true);
 
         sink.record_correction(self.controller.output_ppm(), self.controller.is_clamped());
+    }
+
+    /// Drop the controller's history after the source has been idle.
+    ///
+    /// The ring is about to be refilled from empty by the priming path, so the
+    /// filtered occupancy and the integrator both describe a ring that no
+    /// longer exists — and an integrator that spent the pause looking at an
+    /// empty ring is exactly what used to leave the correction pinned at the
+    /// clamp afterwards.
+    ///
+    /// The resampler's own ratio is deliberately left where it is: nothing
+    /// flows through it while priming, and the first `steer` once the ring is
+    /// back at its setpoint sets it from the fresh controller.
+    fn reset_controller(&mut self) {
+        self.controller.reset();
     }
 
     /// Resample from the ring into the FIFO until it holds `wanted_frames`, or
@@ -548,7 +564,11 @@ fn setup_and_run(
         // *without* draining the ring, letting it fill. This is buffer priming,
         // not drift correction — once primed the read pointer is never adjusted
         // again, so a genuine clock difference still shows up as a trend.
-        let mut primed = false;
+        //
+        // The same handshake is what a source that pauses mid-session comes
+        // back through, which is why the phase now lives in a gate rather than
+        // in a one-way `primed` flag. See `super::idle`.
+        let mut gate = SinkGate::new();
 
         // ---- real-time region begins: no allocation past this point ----
 
@@ -584,23 +604,48 @@ fn setup_and_run(
                 continue;
             }
 
-            if !primed && consumer.slots() / channels >= prebuffer_frames {
-                primed = true;
-                sink.primed.store(true, Ordering::Release);
+            // What this callback does with the ring. Levels in, phase out — no
+            // edge can be missed by a callback that returned early above.
+            let update = gate.update(
+                shared.source_idle(),
+                consumer.slots() / channels,
+                prebuffer_frames,
+            );
+            sink.primed
+                .store(!update.phase.is_priming(), Ordering::Release);
+
+            if update.reset_controller
+                && let Some(stage) = stage.as_mut()
+            {
+                stage.reset_controller();
             }
 
-            if !primed {
+            if update.phase.is_priming() {
                 if write_silence(&render_client, sink, available, channels).is_err() {
                     break;
                 }
                 continue;
             }
 
+            // While the source is idle the endpoint still has to be fed, and
+            // whatever is left in the ring still plays out — but the shortfall
+            // after that is not an underrun and the controller has nothing
+            // useful to regulate.
+            let source_idle = update.phase.is_source_idle();
+
             let result = match stage.as_mut() {
                 // Corrected path: steer the ratio, then run the ring through
                 // delay and resampler into the endpoint.
                 Some(stage) => {
-                    stage.steer(sink, available as usize);
+                    // Frozen rather than bled towards zero while idle. Holding
+                    // the last correction keeps the ratio steady for the tail
+                    // still draining out of the ring, and a bleed would only be
+                    // a second time constant to tune for a figure that is
+                    // discarded on resume anyway — the reset above is what
+                    // actually clears it.
+                    if !source_idle {
+                        stage.steer(sink, available as usize);
+                    }
                     write_resampled(
                         &render_client,
                         sink,
@@ -610,6 +655,7 @@ fn setup_and_run(
                         consumer,
                         available,
                         channels,
+                        source_idle,
                     )
                 }
                 // Uncorrected path: same as milestone 3 apart from the delay
@@ -622,6 +668,7 @@ fn setup_and_run(
                     consumer,
                     available,
                     channels,
+                    source_idle,
                 ),
             };
             if result.is_err() {
@@ -642,6 +689,10 @@ fn setup_and_run(
 
 /// Fill `frames` of the endpoint buffer from the ring, padding with silence.
 ///
+/// `source_idle` decides which tally a shortfall lands in: with a live source
+/// it is an underrun, with a paused one it is silence nobody could have
+/// avoided. See [`SinkState::record_shortfall`].
+///
 /// Allocation-free: samples are copied straight from the ring's storage into
 /// the buffer WASAPI handed back.
 ///
@@ -657,6 +708,7 @@ unsafe fn write_period(
     consumer: &mut Consumer<f32>,
     frames: u32,
     channels: usize,
+    source_idle: bool,
 ) -> Result<(), ()> {
     unsafe {
         let wanted_frames = frames as usize;
@@ -696,9 +748,7 @@ unsafe fn write_period(
 
         let written_frames = whole_frames(written_samples, channels);
         if written_frames < wanted_frames {
-            sink.underruns.fetch_add(1, Ordering::Relaxed);
-            sink.underrun_frames
-                .fetch_add((wanted_frames - written_frames) as u64, Ordering::Relaxed);
+            sink.record_shortfall(wanted_frames - written_frames, source_idle);
             // The endpoint buffer is always filled completely: handing WASAPI a
             // partially written block is what produces an audible click.
             pad_with_silence(dst, written_samples);
@@ -737,6 +787,7 @@ unsafe fn write_resampled(
     consumer: &mut Consumer<f32>,
     frames: u32,
     channels: usize,
+    source_idle: bool,
 ) -> Result<(), ()> {
     unsafe {
         let wanted_frames = frames as usize;
@@ -781,9 +832,7 @@ unsafe fn write_resampled(
         };
         let written_frames = whole_frames(written_samples, channels);
         if written_frames < wanted_frames {
-            sink.underruns.fetch_add(1, Ordering::Relaxed);
-            sink.underrun_frames
-                .fetch_add((wanted_frames - written_frames) as u64, Ordering::Relaxed);
+            sink.record_shortfall(wanted_frames - written_frames, source_idle);
             pad_with_silence(dst, written_samples);
         }
 

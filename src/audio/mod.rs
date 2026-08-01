@@ -7,6 +7,7 @@ pub mod control;
 pub mod delay;
 pub mod drift;
 pub mod frames;
+pub mod idle;
 pub mod level;
 pub mod passthrough;
 pub mod render;
@@ -195,6 +196,47 @@ impl FaultSlot {
     }
 }
 
+/// What the drift-correction readout is reporting right now.
+///
+/// Three states rather than a formatted string, because the CLI and the window
+/// lay it out differently but must agree on what it says.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CorrectionReadout {
+    /// `--no-correction`: there is no controller running to report on.
+    Off,
+    /// The source is delivering nothing, so the controller is frozen and its
+    /// last figure describes a ring that is no longer moving. Showing a ppm
+    /// number here would be showing a stale one.
+    SourceIdle,
+    Live {
+        ppm: f64,
+        clamped: bool,
+    },
+}
+
+impl CorrectionReadout {
+    /// Free-width rendering, for the window and anything else without a fixed
+    /// column to fill.
+    pub fn label(self) -> String {
+        match self {
+            CorrectionReadout::Off => "off".to_string(),
+            CorrectionReadout::SourceIdle => "SOURCE IDLE".to_string(),
+            CorrectionReadout::Live { ppm, clamped } => {
+                format!("{ppm:+.1} ppm{}", if clamped { "  CLAMPED" } else { "" })
+            }
+        }
+    }
+
+    /// True when the value is reporting something the user should look at.
+    ///
+    /// A clamped controller is a device problem, not drift. An idle source is
+    /// neither — it is just the user having paused something — so it
+    /// deliberately does not alert.
+    pub fn is_alert(self) -> bool {
+        matches!(self, CorrectionReadout::Live { clamped: true, .. })
+    }
+}
+
 /// Per-sink counters, one instance per render thread.
 ///
 /// Cache-line aligned. Without the alignment two sinks' counters would share a
@@ -223,6 +265,14 @@ pub struct SinkState {
     /// Frames of silence rendered while priming the ring up to its setpoint.
     /// Distinct from underruns: these are deliberate, not a failure.
     pub prime_frames: AtomicU64,
+    /// Frames of silence substituted while the source was idle.
+    ///
+    /// Also distinct from underruns, and for the same reason: a paused source
+    /// delivers no loopback packets at all, so there is nothing for the ring to
+    /// hold and nothing anyone could have done differently. Keeping these out
+    /// of the underrun tally is what leaves that tally meaning "the engine
+    /// missed frames it should have had".
+    pub source_idle_frames: AtomicU64,
 
     /// Set once this sink's render client is started.
     pub running: AtomicBool,
@@ -283,6 +333,7 @@ impl SinkState {
             overruns: AtomicU64::new(0),
             overrun_frames: AtomicU64::new(0),
             prime_frames: AtomicU64::new(0),
+            source_idle_frames: AtomicU64::new(0),
             running: AtomicBool::new(false),
             primed: AtomicBool::new(false),
             mmcss: AtomicBool::new(false),
@@ -298,6 +349,50 @@ impl SinkState {
             mute: AtomicBool::new(false),
             peak_bits: AtomicU32::new(0),
             ring_frames,
+        }
+    }
+
+    /// Account for silence substituted because the ring could not fill a whole
+    /// block, attributing it to whichever of the two causes applies.
+    ///
+    /// With a live source this is an underrun: frames that should have been
+    /// there were not. With an idle source it is not a failure at all — WASAPI
+    /// delivers no loopback packets from an endpoint nothing is rendering to,
+    /// so the ring is empty because there is nothing to put in it. Counting
+    /// those as underruns is what made the counters climb for the whole length
+    /// of a pause and buried any real underrun in the noise.
+    ///
+    /// Render thread only: plain atomic arithmetic, no allocation.
+    pub fn record_shortfall(&self, frames: usize, source_idle: bool) {
+        if source_idle {
+            self.source_idle_frames
+                .fetch_add(frames as u64, Ordering::Relaxed);
+            return;
+        }
+        self.underruns.fetch_add(1, Ordering::Relaxed);
+        self.underrun_frames
+            .fetch_add(frames as u64, Ordering::Relaxed);
+    }
+
+    pub fn source_idle_frames(&self) -> u64 {
+        self.source_idle_frames.load(Ordering::Relaxed)
+    }
+
+    /// What the correction readout should say, for whichever front end asks.
+    ///
+    /// The formatting differs between the CLI's fixed-width column and the
+    /// window's readout grid, but the decision — off, frozen, or a live figure
+    /// — is the same one and lives here so it is tested once.
+    pub fn correction_readout(&self, source_idle: bool) -> CorrectionReadout {
+        if !self.correction_enabled() {
+            return CorrectionReadout::Off;
+        }
+        if source_idle {
+            return CorrectionReadout::SourceIdle;
+        }
+        CorrectionReadout::Live {
+            ppm: self.correction_ppm(),
+            clamped: self.correction_clamped_updates() > 0,
         }
     }
 
@@ -444,6 +539,16 @@ pub struct SharedState {
     pub capture_mmcss: AtomicBool,
     pub capture_fault: FaultSlot,
     pacing: AtomicU32,
+    /// Set while the capture stream is delivering no packets at all.
+    ///
+    /// Global, like `frames_captured`, because there is one capture stream: an
+    /// idle source is idle for every sink at once. Published by the capture
+    /// thread, read by both render threads and by whichever front end is
+    /// showing status.
+    source_idle: AtomicBool,
+    /// How many times the source has gone idle this session — pauses, not
+    /// callbacks.
+    source_idle_events: AtomicU64,
     /// Peak of the most recent captured packet, as `f32` bits — the source
     /// meter. One per session, because there is one capture stream.
     capture_peak_bits: AtomicU32,
@@ -472,6 +577,8 @@ impl SharedState {
             capture_mmcss: AtomicBool::new(false),
             capture_fault: FaultSlot::default(),
             pacing: AtomicU32::new(CapturePacing::Undetermined.code()),
+            source_idle: AtomicBool::new(false),
+            source_idle_events: AtomicU64::new(0),
             capture_peak_bits: AtomicU32::new(0),
             sinks: std::array::from_fn(|_| SinkState::new(ring_frames)),
             sink_count: sink_count.min(MAX_SINKS),
@@ -504,6 +611,31 @@ impl SharedState {
 
     pub fn pacing(&self) -> CapturePacing {
         CapturePacing::from_code(self.pacing.load(Ordering::Relaxed))
+    }
+
+    /// Publish the capture thread's idle verdict.
+    ///
+    /// A false→true transition also bumps the event counter, so the count is of
+    /// pauses rather than of callbacks. Done with a `swap` rather than by
+    /// trusting the caller to only write transitions: the counter stays right
+    /// however often this is called.
+    ///
+    /// `Release` so a render thread that sees the flag also sees everything the
+    /// capture thread wrote before it.
+    pub fn set_source_idle(&self, idle: bool) {
+        let was_idle = self.source_idle.swap(idle, Ordering::Release);
+        if idle && !was_idle {
+            self.source_idle_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// True while the source endpoint is producing no loopback packets.
+    pub fn source_idle(&self) -> bool {
+        self.source_idle.load(Ordering::Acquire)
+    }
+
+    pub fn source_idle_events(&self) -> u64 {
+        self.source_idle_events.load(Ordering::Relaxed)
     }
 
     /// Peak of the most recent captured packet, linear.
@@ -688,6 +820,134 @@ mod tests {
         assert_eq!(shared.sink(1).overruns.load(Ordering::Relaxed), 0);
         assert_eq!(shared.sink(0).ring_occupancy_frames(), 0);
         assert_eq!(shared.sink(1).ring_occupancy_frames(), 480);
+    }
+
+    // ---- source idle ----
+
+    #[test]
+    fn a_shortfall_with_a_live_source_is_an_underrun() {
+        let sink = SinkState::new(24_000);
+        sink.record_shortfall(480, false);
+        sink.record_shortfall(240, false);
+
+        assert_eq!(sink.underruns.load(Ordering::Relaxed), 2);
+        assert_eq!(sink.underrun_frames.load(Ordering::Relaxed), 720);
+        assert_eq!(sink.source_idle_frames(), 0);
+    }
+
+    #[test]
+    fn a_shortfall_while_the_source_is_idle_is_not_an_underrun() {
+        // The whole point of the separate tally: a five-second pause used to
+        // add five seconds of underruns and make the counter meaningless.
+        let sink = SinkState::new(24_000);
+        for _ in 0..500 {
+            sink.record_shortfall(480, true);
+        }
+
+        assert_eq!(sink.underruns.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.underrun_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.source_idle_frames(), 240_000);
+    }
+
+    #[test]
+    fn the_two_shortfall_tallies_stay_independent() {
+        let sink = SinkState::new(24_000);
+        sink.record_shortfall(480, true);
+        sink.record_shortfall(96, false);
+        sink.record_shortfall(480, true);
+
+        assert_eq!(sink.underruns.load(Ordering::Relaxed), 1);
+        assert_eq!(sink.underrun_frames.load(Ordering::Relaxed), 96);
+        assert_eq!(sink.source_idle_frames(), 960);
+    }
+
+    #[test]
+    fn the_idle_flag_starts_clear_and_round_trips() {
+        let shared = SharedState::new(1, 24_000);
+        assert!(!shared.source_idle());
+        assert_eq!(shared.source_idle_events(), 0);
+
+        shared.set_source_idle(true);
+        assert!(shared.source_idle());
+        shared.set_source_idle(false);
+        assert!(!shared.source_idle());
+    }
+
+    #[test]
+    fn idle_events_count_pauses_not_calls() {
+        let shared = SharedState::new(1, 24_000);
+        for _ in 0..100 {
+            shared.set_source_idle(true);
+        }
+        assert_eq!(shared.source_idle_events(), 1, "one pause, counted once");
+
+        shared.set_source_idle(false);
+        shared.set_source_idle(true);
+        assert_eq!(shared.source_idle_events(), 2);
+    }
+
+    #[test]
+    fn the_correction_readout_reports_all_three_states() {
+        let sink = SinkState::new(24_000);
+
+        // Correction disabled outranks everything: there is no controller.
+        assert_eq!(sink.correction_readout(false), CorrectionReadout::Off);
+        assert_eq!(sink.correction_readout(true), CorrectionReadout::Off);
+
+        sink.set_correction_enabled(true);
+        sink.record_correction(-14.2, false);
+        assert_eq!(
+            sink.correction_readout(false),
+            CorrectionReadout::Live {
+                ppm: -14.2,
+                clamped: false
+            }
+        );
+        // An idle source hides the stale figure rather than showing it.
+        assert_eq!(sink.correction_readout(true), CorrectionReadout::SourceIdle);
+    }
+
+    #[test]
+    fn the_correction_readout_labels_itself() {
+        assert_eq!(CorrectionReadout::Off.label(), "off");
+        assert_eq!(CorrectionReadout::SourceIdle.label(), "SOURCE IDLE");
+        assert_eq!(
+            CorrectionReadout::Live {
+                ppm: -14.25,
+                clamped: false
+            }
+            .label(),
+            "-14.2 ppm"
+        );
+        assert!(
+            CorrectionReadout::Live {
+                ppm: 500.0,
+                clamped: true
+            }
+            .label()
+            .contains("CLAMPED")
+        );
+    }
+
+    #[test]
+    fn only_a_clamped_controller_alerts() {
+        // An idle source is the user pausing something, not a fault.
+        assert!(!CorrectionReadout::Off.is_alert());
+        assert!(!CorrectionReadout::SourceIdle.is_alert());
+        assert!(
+            !CorrectionReadout::Live {
+                ppm: -14.0,
+                clamped: false
+            }
+            .is_alert()
+        );
+        assert!(
+            CorrectionReadout::Live {
+                ppm: 500.0,
+                clamped: true
+            }
+            .is_alert()
+        );
     }
 
     #[test]

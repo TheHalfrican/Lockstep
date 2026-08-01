@@ -19,7 +19,7 @@ use anyhow::{Result, bail};
 use super::command::{StdinAction, parse_line};
 use super::drift::DriftEstimator;
 use super::session::{PREBUFFER_FRACTION, RING_DURATION_MS, Session, SessionConfig, display_name};
-use super::{SharedState, SinkState};
+use super::{CorrectionReadout, SharedState, SinkState};
 use crate::devices::DeviceInfo;
 
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(1);
@@ -205,6 +205,12 @@ fn status_loop(
     let mut next_status = start + status_interval;
     let mut last_captured = 0u64;
     let mut last_rendered = vec![0u64; session.sink_count()];
+    // Occupancy before and after a pause belong to two different ring fills —
+    // the sink re-primes from empty in between — so fitting a line across one
+    // would read the refill as an enormous drift. The event counter catches
+    // pauses that started and ended between two status samples, which a bare
+    // "is it idle now" check would miss entirely.
+    let mut last_idle_events = 0u64;
 
     loop {
         if session.should_stop() {
@@ -245,14 +251,25 @@ fn status_loop(
         let elapsed = start.elapsed().as_secs_f64();
         let shared = session.shared();
         let captured = shared.frames_captured.load(Ordering::Relaxed);
+        let source_idle = shared.source_idle();
+
+        // A pause since the last sample invalidates every fit in progress.
+        let idle_events = shared.source_idle_events();
+        if idle_events != last_idle_events {
+            last_idle_events = idle_events;
+            for estimator in estimators.iter_mut() {
+                *estimator = DriftEstimator::new(sample_rate, warmup);
+            }
+        }
 
         println!(
-            "t={:7.1}s  captured={:>11} (+{:>7})  pace={}  src={:5.1} dBFS",
+            "t={:7.1}s  captured={:>11} (+{:>7})  pace={}  src={:5.1} dBFS{}",
             elapsed,
             captured,
             captured.saturating_sub(last_captured),
             shared.pacing().as_str(),
             dbfs(shared.capture_peak()),
+            if source_idle { "  SOURCE IDLE" } else { "" },
         );
         last_captured = captured;
 
@@ -262,27 +279,26 @@ fn status_loop(
             let rendered = sink.frames_rendered.load(Ordering::Relaxed);
             let occupancy = sink.ring_occupancy_frames();
 
-            // Only fit once the ring has reached its setpoint. Occupancy is
-            // still climbing during priming, and folding that ramp into the
+            // Only fit once the ring has reached its setpoint, and never while
+            // the source is idle. Occupancy is still climbing during priming
+            // and collapsing during a pause, and folding either ramp into the
             // fit would read as an enormous fake drift.
             let primed = sink.primed.load(Ordering::Acquire);
-            if primed {
+            if primed && !source_idle {
                 estimators[index].observe(elapsed, occupancy);
             }
 
             // Under correction this should read ~0: a flat ring is the success
             // signal, and the drift itself has moved into the correction
             // figure next to it.
-            let drift_label = if primed {
+            let drift_label = if source_idle {
+                "idle".to_string()
+            } else if primed {
                 estimators[index].short_label()
             } else {
                 "priming".to_string()
             };
-            let correction_label = if sink.correction_enabled() {
-                format!("{:+7.1} ppm", sink.correction_ppm())
-            } else {
-                "     off".to_string()
-            };
+            let correction_label = correction_cell(sink.correction_readout(source_idle));
 
             println!(
                 "    sink {index} {:<26}  out={:>11} (+{:>7})  ring={:5.1}% ({:>6}/{} fr)  \
@@ -310,6 +326,17 @@ fn status_loop(
     }
 
     estimators
+}
+
+/// The `corr=` column, padded to a fixed width so the status block stays in
+/// alignment from line to line.
+fn correction_cell(readout: CorrectionReadout) -> String {
+    match readout {
+        CorrectionReadout::Off => "     off".to_string(),
+        // The controller is frozen: a ppm figure here would be a stale one.
+        CorrectionReadout::SourceIdle => "    IDLE".to_string(),
+        CorrectionReadout::Live { ppm, .. } => format!("{ppm:+7.1} ppm"),
+    }
 }
 
 /// Linear peak to dBFS, floored so silence prints as a number rather than
@@ -345,6 +372,10 @@ fn print_summary(session: &Session, estimators: &[DriftEstimator]) {
     );
     println!("  capture pacing     {}", shared.pacing().as_str());
     println!(
+        "  source idle        {} pause(s) — the endpoint stopped producing loopback packets",
+        shared.source_idle_events()
+    );
+    println!(
         "  capture MMCSS      {}",
         yes_no(shared.capture_mmcss.load(Ordering::Relaxed))
     );
@@ -379,6 +410,10 @@ fn print_summary(session: &Session, estimators: &[DriftEstimator]) {
         println!(
             "    priming silence    {} frames (deliberate, before the ring reached setpoint)",
             sink.prime_frames.load(Ordering::Relaxed)
+        );
+        println!(
+            "    source idle        {} frames (deliberate, while the source produced nothing)",
+            sink.source_idle_frames()
         );
         println!(
             "    underruns          {} ({} frames of silence substituted)",
@@ -528,6 +563,30 @@ mod tests {
         let cut = truncate(name, 8);
         assert_eq!(cut.chars().count(), 8);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn the_correction_column_keeps_its_width() {
+        // The status block is read by scanning down a column, so every state
+        // has to occupy the same one.
+        let cells = [
+            correction_cell(CorrectionReadout::Off),
+            correction_cell(CorrectionReadout::SourceIdle),
+            correction_cell(CorrectionReadout::Live {
+                ppm: -14.2,
+                clamped: false,
+            }),
+        ];
+        assert_eq!(cells[0].len(), cells[1].len());
+        assert!(cells[2].ends_with(" ppm"));
+    }
+
+    #[test]
+    fn an_idle_source_shows_no_ppm_figure() {
+        // A frozen controller's last number is stale; saying so is the point.
+        let cell = correction_cell(CorrectionReadout::SourceIdle);
+        assert!(cell.contains("IDLE"), "{cell}");
+        assert!(!cell.contains("ppm"), "{cell}");
     }
 
     #[test]

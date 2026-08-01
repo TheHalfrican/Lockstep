@@ -44,12 +44,14 @@ Working today, on real hardware:
   certified by an hour-long soak with zero underruns/overruns
 - ✅ Per-output delay lines with click-free 10 ms crossfade on changes
 - ✅ Per-output gain and mute (zipper-free)
+- ✅ Mask-aware channel adaptation where the source and an output disagree:
+  multichannel → stereo downmix (ITU-R BS.775) and stereo → multichannel
+  placement, keyed on `dwChannelMask` rather than channel count
 - ✅ `egui` GUI: device selection, transport, level meters, delay/gain/mute,
   live correction readout — plus a full CLI (`list` / `play`)
 
 In progress / planned:
 
-- ⏳ Multichannel → stereo downmix (ITU-R BS.775) where channel counts differ
 - ⏳ Named presets keyed on stable device IDs, hotplug-safe reconnection
 - ⏳ Click-train calibration mode for aligning outputs by ear
 
@@ -57,9 +59,10 @@ In progress / planned:
 
 - Windows 10/11 (WASAPI and the `windows` crate — this is Windows-only by design)
 - Rust stable (build from source; no binary releases yet)
-- Two audio output devices whose shared-mode mix formats match in sample rate
-  and channel count (sample-rate conversion between mismatched endpoints is not
-  yet supported)
+- Two audio output devices whose shared-mode mix formats agree on sample rate
+  (sample-rate conversion between mismatched endpoints is not yet supported).
+  Channel counts may differ freely — a 5.1 HDMI output and a stereo headset is
+  the case this was built for
 
 ## Quick start
 
@@ -86,16 +89,18 @@ verbatim ID strings from `list` are stable and always preferred.
 ```
 WASAPI loopback capture (source endpoint)
         │
-        ├──> ring ──> [delay] ──> [ASRC] ──> render thread A
+        ├──> ring ──> [downmix] ──> [delay] ──> [ASRC] ──> render thread A
         │
-        └──> ring ──> [delay] ──> [ASRC] ──> render thread B
+        └──> ring ──> [downmix] ──> [delay] ──> [ASRC] ──> render thread B
 ```
 
 One event-driven capture thread feeds two lock-free rings (`rtrb`). Each
-output has an independent render thread: a delay line (preallocated circular
-buffer, crossfaded read pointer), then an adaptive sinc resampler (`rubato`)
-whose ratio is trimmed ±500 ppm by a PI controller holding ring occupancy at
-setpoint — that trim is what absorbs the clock disagreement between devices.
+output has an independent render thread: channel adaptation to that endpoint's
+speaker layout, a delay line (preallocated circular buffer, crossfaded read
+pointer), then an adaptive sinc resampler (`rubato`) whose ratio is trimmed
+±500 ppm by a PI controller holding ring occupancy at setpoint — that trim is
+what absorbs the clock disagreement between devices. Adaptation comes first, so
+everything downstream of the ring runs in the endpoint's own channel count.
 
 The audio threads follow strict real-time discipline: no allocation, no locks,
 no logging past stream start. GUI ↔ audio communication is atomics for values

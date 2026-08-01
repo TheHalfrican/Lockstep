@@ -2,6 +2,7 @@
 //! the state shared between those threads and the reporting thread.
 
 pub mod capture;
+pub mod channelmap;
 pub mod command;
 pub mod control;
 pub mod delay;
@@ -99,6 +100,7 @@ pub enum FaultStage {
     ResamplerInit = 17,
     Resample = 18,
     DelayInit = 19,
+    ChannelMap = 20,
 }
 
 impl FaultStage {
@@ -123,6 +125,7 @@ impl FaultStage {
             17 => FaultStage::ResamplerInit,
             18 => FaultStage::Resample,
             19 => FaultStage::DelayInit,
+            20 => FaultStage::ChannelMap,
             _ => FaultStage::None,
         }
     }
@@ -149,6 +152,7 @@ impl FaultStage {
             FaultStage::ResamplerInit => "building the resampler",
             FaultStage::Resample => "Resampler::process_into_buffer",
             FaultStage::DelayInit => "building the delay line",
+            FaultStage::ChannelMap => "building the channel adaptation plan",
         }
     }
 }
@@ -722,6 +726,7 @@ mod tests {
             FaultStage::ResamplerInit,
             FaultStage::Resample,
             FaultStage::DelayInit,
+            FaultStage::ChannelMap,
         ];
         for stage in stages {
             assert_eq!(FaultStage::from_code(stage as u32), stage);

@@ -96,6 +96,7 @@ fn print_header(
         println!("sink {index}   {}", plan.label);
         println!("         {}", plan.device_id);
         println!("         delay {:.1} ms at startup", plan.delay_ms);
+        println!("         channels {}", plan.adaptation.summary());
     }
     println!("format   {}", session.format().summary());
     println!(
@@ -385,6 +386,7 @@ fn print_summary(session: &Session, estimators: &[DriftEstimator]) {
         println!();
         println!("  sink {index}  {}", plan.label);
         println!("    {}", plan.device_id);
+        println!("    channels           {}", plan.adaptation.summary());
         println!(
             "    delay              {:.1} ms at exit (started at {:.1} ms)",
             sink.delay_ms(sample_rate),

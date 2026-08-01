@@ -154,8 +154,8 @@ pub enum SinkPhase {
     /// while it is trying to fill is what would stop it ever reaching the
     /// setpoint.
     Priming,
-    /// Normal passthrough: `ring → [delay] → [ASRC] → endpoint`, drift
-    /// correction running.
+    /// Normal passthrough: `ring → [downmix] → [delay] → [ASRC] → endpoint`,
+    /// drift correction running.
     Running,
     /// The source has stopped delivering. Audio still flows — whatever is left
     /// in the ring plays out and the shortfall after that is silence — but the

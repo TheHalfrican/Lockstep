@@ -119,6 +119,8 @@ A PI controller on ring buffer fill level drives the resampler ratio.
 
 Track and display underrun and overrun counts. When something eventually breaks, a ppm figure reading +180 instead of +3 immediately distinguishes a drift problem from everything else.
 
+> **Measured caveat (2026-08-04, see HARDWARE.md overnight-batch findings).** With instantaneous packet-quantized ring occupancy as the feedback variable, the controller runs a relaxation limit cycle on real drift: correction reads ≈0 ppm for minutes, then bursts to +150–490 ppm once occupancy crosses a 480-frame capture-packet boundary. The long-run *mean* is exact, but the live readout misleads (it manufactured the "adaptive sink" anomaly) and bursts brush the ±500 ppm clamp on a 28 ppm pair. Queued fix, not landed: filter occupancy over ≥ one packet period (or feed the PI a frames-in/out rate estimate) and display the filtered correction.
+
 ### Delay lines
 
 Per-output circular buffer, 0–250 ms range. At 48 kHz, 8 channels, f32, 250 ms is ~384 KB — allocate the maximum up front and vary the read pointer.

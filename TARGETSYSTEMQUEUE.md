@@ -1,13 +1,26 @@
 # Target-system queue
 
 Checks to run on the home machine with the real hardware attached: Astro A50X,
-Astro A50 Gen 4, Sony receiver over HDMI eARC. Everything below was either
-impossible on the work machine (wrong hardware) or produced numbers too soft to
-tune against (Bluetooth timebase, silence-only runs).
+Astro A50 Gen 4, Yamaha RX-V385 receiver over HDMI audio return (docs said
+"Sony" before 2026-07-31). Everything below was either impossible on the work
+machine (wrong hardware) or produced numbers too soft to tune against
+(Bluetooth timebase, silence-only runs).
 
 Work through it in order — later items depend on IDs and formats recorded in
 earlier ones. Paste results into `HARDWARE.md` (create it) as you go; that file
 becomes the reference the preset defaults and PI tuning are built from.
+
+> **Status 2026-08-04** — results live in `HARDWARE.md`, section for section.
+> §0–§2 complete (§2 verdict FINAL: 5.1 LPCM, matrix stays). §3 done for
+> A50X/HDMI; Gen 4 *as source* still unmeasured. §4 and §4b complete. §5
+> uncorrected baselines complete for both preset pairs plus Realtek. §5b
+> soaks ran overnight 2026-08-04: zero underruns/overruns and implied
+> offsets match baselines, but correction *oscillates* — the §5b criterion
+> flagged below fired; diagnosed as a packet-quantization limit cycle (see
+> HARDWARE.md, overnight-batch findings). §5's music-load runs and §5b's
+> music soak still open. §6 power-cycle checks not run (one accidental
+> reconfiguration fault recorded). §7 ongoing — HARDWARE.md committed and
+> pushed through `03c2de4`.
 
 ---
 

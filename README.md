@@ -41,7 +41,8 @@ Working today, on real hardware:
 - ✅ Device enumeration with mix-format detail (channel masks, sample formats)
 - ✅ Loopback capture → dual-output passthrough, real-time safe
 - ✅ Automatic drift correction — PI controller + `rubato` async resampler,
-  certified by an hour-long soak with zero underruns/overruns
+  certified by hour-long soaks with zero underruns/overruns on both target
+  hardware pairs
 - ✅ Per-output delay lines with click-free 10 ms crossfade on changes
 - ✅ Per-output gain and mute (zipper-free)
 - ✅ Mask-aware channel adaptation where the source and an output disagree:

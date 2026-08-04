@@ -242,8 +242,9 @@ minutes apart, unprovoked.
 
 Both preset pairs drift harder than the work machine's ~-14 ppm; both are
 18–25× inside the ±500 ppm clamp. Setpoint control at 50% has ample
-headroom. Remaining §5/§5b work: at least one music-load run per pair, and
-the hour-long corrected soaks (overnight-friendly: silence, zero attention).
+headroom. Remaining §5/§5b work: at least one music-load run per pair
+(*still pending*); the hour-long corrected soaks ran 2026-08-04 — see the
+overnight-batch section.
 | **Realtek S/PDIF (refinement)** | **1125 s** | **-11.44 ppm ± 1.63** | **significant (~7σ) — real cross-clock drift; projected underrun ~5.6 h on 500 ms ring** | 0 / 0 |
 
 **Finding: A50X Game and Voice share an effective clock** (within ~1 ppm
@@ -362,6 +363,12 @@ If confirmed: correction demand depends on *topology*, not just the pair —
 mirroring TO the A50X may need near-zero correction. Design-relevant for
 preset defaults.
 
+**RESOLVED 2026-08-04 — hypothesis refuted.** Uncorrected SAMSUNG→A50X
+reads **+19.10 ± 1.56 ppm**, matching the crystal prediction (+19.7);
+the A50X as sink free-runs like everything else. The three "~0 ppm"
+readings were the correction *display* inside a PI limit cycle — see
+the overnight-batch section below.
+
 ## §4b GUI shakedown — first session
 
 Topology (user-discovered, now canonical for media): **source = Realtek
@@ -423,6 +430,8 @@ pattern removes any need for a virtual audio device in the media case.
   real open question — overnight batch: three uncorrected 20-min runs
   (SAMSUNG→A50X, SAMSUNG→Gen 4 Voice triangle: predict -8.5,
   Realtek→SAMSUNG: predict -8.3) plus §5b corrected hour-soaks per pair.
+  *(Confirmed 2026-08-04: clean uncorrected figure -7.44 ± 1.57 ppm,
+  0.3σ from the prediction — mid-recovery reading explained.)*
 - **UX finding — meter zones mislead at unity.** Loud mastered music at
   unity gain sits near full scale (honest), meters showed it above green,
   user attenuated both outputs to "keep it green" — unnecessary, since
@@ -467,7 +476,127 @@ Deferred optimization note: a 2→6 upmap runs delay+ASRC at 6 ch (4 silent),
 If it ever crowds the deadline, split adaptation: downmix before delay,
 upmap after ASRC.
 
+## Overnight batch 2026-08-04 — anomaly runs and §5b corrected soaks
+
+Five unattended sequential runs, 01:46–04:46, all silence, control sink =
+source endpoint in each (keeps loopback alive). Three ~19-min uncorrected
+anomaly runs, then two 1-h corrected soaks. All five exited 0; **zero
+underruns/overruns anywhere** (~1.0 G frames rendered total). Full logs
+in the session scratchpad; end-of-run fits only, per the screening rule.
+
+### Uncorrected runs — the adaptive-sink anomaly is dead
+
+| Run | Sink 1 fit | Prediction | Verdict |
+|---|---|---|---|
+| SAMSUNG → A50X | **+19.10 ± 1.56 ppm** | +19.7 if crystals honest, ~0 if adaptive | **hypothesis REFUTED — crystal-honest** |
+| SAMSUNG → Gen 4 Voice | **-12.30 ± 1.48 ppm** | -8.5 from the 3-day-old baselines | closes within ~1.4σ (see wander note) |
+| Realtek → SAMSUNG | **-7.44 ± 1.57 ppm** | -8.3 | 0.3σ — textbook closure |
+
+Control sinks flat in all three (+0.32 / +0.88 / -1.17, none significant)
+— instrument valid every run. The A50X as render sink free-runs like
+everything else; there is no adaptive USB mode. Every triangle closes
+*internally* on the same night: run 1 + run 2 ⇒ A50X→Gen 4 ≈ -31.4, and
+run 4's implied offset is **-30.94**; run 4 − run 5 ⇒ SAMSUNG→Gen 4
+≈ -11.4 vs run 2's -12.30 (0.6σ). Against the 3-day-old baselines the
+residuals are a few ppm: **crystals wander slightly across days /
+temperature. Treat stored baselines as ±5 ppm across sessions;
+same-session arithmetic is good to ~1 ppm.**
+
+So what produced three "~0 ppm steady" A50X-sink readings? The correction
+*display*, not the hardware — the controller spends most of each cycle
+reading ≈0 between bursts (finding 1 below). All prior anomalies collapse
+into one instrument artifact.
+
+### §5b corrected soaks — 3 of 4 criteria pass; oscillation flagged
+
+| Pair | Duration | Under/over | Ring at exit | Implied offset (mean corr) | Baseline |
+|---|---|---|---|---|---|
+| Two headsets (A50X → Gen 4 Voice) | 3600 s | **0 / 0** | 49.9 / 50.3 % | **-30.94 ppm** | -28.24 (tonight's own triangle: -31.4) |
+| Home theater (A50X → SAMSUNG) | 3600 s | **0 / 0** | 49.9 / 48.0 % | **-19.53 ppm** | -19.71 — 0.2 ppm agreement |
+
+Zero underruns/overruns: **pass.** Ring at setpoint (within one capture
+packet): **pass.** Never clamped (peak +488, not pinned): **pass.**
+Correction settled and *stable*: **fail as written** — the correction
+waveform is a relaxation oscillation, exactly the condition §5b says to
+report. Root cause diagnosed below; the *mean* still integrates to the
+true offset, which is why the implied offsets match the baselines. The
+music-load soak checkbox remains open. No SOURCE IDLE during any run.
+Capture pacing: A50X event-driven in both soaks; SAMSUNG and Realtek
+polled in all three uncorrected runs — §3 tally grows, split unchanged.
+
+### Finding 1 — PI limit cycle from packet-quantized occupancy
+
+Both soaks show the same sawtooth: correction reads ≈0 while the ring
+drains at the raw drift rate; occupancy crosses a 480-frame
+capture-packet boundary; the controller sees a sustained step and bursts
+to +150–490 ppm for ~10–30 s, refilling the packet; rings down
+(-20 → -10 → -5 → -2 → ≈0); repeat. Period matches the drift arithmetic:
+~356 s measured vs ~372 predicted (two headsets), ~576 vs ~589 (home
+theater). Bursts are inaudible (500 ppm < 1 cent) and the hour mean is
+correct, but two real costs:
+
+- **The instantaneous correction readout is misleading** — ≈0 for minutes
+  regardless of true drift. This manufactured the adaptive-sink anomaly
+  and defeats the "+180 vs +3 at a glance" status-bar diagnostic.
+- **Bursts brush the ±500 ppm clamp** (+488 observed) during *normal*
+  operation on a 28 ppm pair — clamp margin consumed by the limit cycle,
+  not by drift.
+
+Root cause: the PI feedback variable is instantaneous ring occupancy,
+quantized in 480-frame packets, while the signal is ~1 frame/s. Fix
+direction (follow-up, not landed): filter occupancy over ≥ one packet
+period — or feed the PI a frames-in/frames-out rate estimate — and
+display the filtered correction. Work-machine tuning never saw this: at
+~14 ppm the cycle period is ~12 min, longer than any observation window
+used there.
+
+### Finding 2 — control-sink topology is regenerative under correction
+
+Both soaks show output level climbing steadily from ≈-95 dBFS to
+**-26 dBFS over the hour** (~+6 dB per 5 min — exponential amplitude
+growth). The control sink renders back into the source endpoint, so the
+chain is a unity-gain feedback loop; with correction active the ASRC
+sits inside that loop (summary lines confirm the ASRC is only in-path
+when correction is on), and any passband ripple above unity compounds
+every ~0.3 s pass. The uncorrected runs — same topology, no ASRC —
+stayed at the -99 dB meter floor for 19 minutes. Another ~25 min of soak
+would have reached full scale on live endpoints, at 5 AM.
+
+- **Measurement methodology:** corrected long runs must not use an
+  audible control sink at unity gain. Mute the control sink — it still
+  renders (silence) and keeps loopback alive, but breaks the loop. The
+  CLI currently has no gain/mute flag: follow-up.
+- **Product:** real presets never feed a sink back into its source (the
+  silent-carrier topology exists precisely to avoid this) and the CLI
+  already prints a feedback warning. Not a product bug; keep the warning
+  loud.
+- Incidental stress datum: with loop content growing ~65 dB the path
+  stayed clean — zero underruns, ring at setpoint. Content-agnostic, as
+  designed.
+
+### Minor observations
+
+- All three uncorrected runs logged `source idle: 1 pause(s)` (0 idle
+  frames, resolved before the first status line). Startup artifact: the
+  source endpoint is genuinely idle until the control sink's priming
+  silence starts the engine — the gate fired exactly as specified, so
+  not a regression. Polish follow-up: don't count a pause before the
+  first-ever capture packet, so unattended summaries read clean.
+- Soaks primed with 1920 frames of silence vs 13920 in the uncorrected
+  runs — event-driven capture (A50X) delivers immediately; polled
+  sources (SAMSUNG, Realtek) take longer to wake. Consistent, no action.
+
+### Follow-ups from the batch
+
+1. Filter the PI feedback (or switch to a rate estimate) to kill the
+   limit cycle; display filtered correction. (finding 1)
+2. CLI `--mute <sink-index>` or `--gain` flag so corrected soaks can run
+   a silent control sink. (finding 2)
+3. Suppress the source-idle pause counter until first capture packet.
+4. Music-load §5b runs per pair — still the open soak checkbox, needs
+   ears.
+
 ## §5b / §6 — pending user presence
 
-Audible passthrough, GUI shakedown, corrected soaks, music-load runs, and
-fault-injection reality checks all need ears and hands on site.
+Music-load soak runs (§5b's last checkbox) and fault-injection reality
+checks (§6 power-cycle class) still need ears and hands on site.
